@@ -236,6 +236,15 @@ func validateStep(step Step, topLevel bool, workflowName string) error {
 		if topLevel && strings.TrimSpace(step.Name) == "" {
 			return fmt.Errorf("top-level <transform> in workflow %q must define name", workflowName)
 		}
+		if step.TransformMode() == "js" {
+			if len(step.Children) > 0 {
+				return fmt.Errorf("<transform mode=js> in workflow %q does not support child steps", workflowName)
+			}
+			if strings.TrimSpace(step.Body()) == "" {
+				return fmt.Errorf("<transform name=%q mode=js> in workflow %q must define script body", step.Name, workflowName)
+			}
+			break
+		}
 		if step.TransformMode() == "tree" {
 			if len(step.Children) > 0 {
 				return fmt.Errorf("<transform mode=%q> in workflow %q does not support child steps", step.TransformMode(), workflowName)

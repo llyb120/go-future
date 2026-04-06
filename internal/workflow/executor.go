@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 
+	"go-ai-future/internal/jsruntime"
+
 	"github.com/llyb120/gosql"
 )
 
@@ -278,6 +280,8 @@ func (e *Executor) evaluateTransform(step Step, vars map[string]any, current any
 		return e.evaluateGroupTransform(step, vars, current)
 	case "index":
 		return e.evaluateIndexTransform(step, vars, current)
+	case "js":
+		return e.evaluateJSTransform(step, vars, current)
 	case "tree":
 		return e.evaluateTreeTransform(step, vars, current)
 	default:
@@ -528,6 +532,93 @@ func (e *Executor) evaluateTreeTransform(step Step, vars map[string]any, current
 	}
 
 	return tree, nil
+}
+
+func (e *Executor) evaluateJSTransform(step Step, vars map[string]any, current any) (any, error) {
+	source, err := e.resolveValue(Step{
+		From:     step.From,
+		Value:    step.Value,
+		Template: step.Template,
+		Default:  step.Default,
+		Optional: step.Optional,
+	}, vars, current, true)
+	if err != nil {
+		return nil, err
+	}
+
+	rt, err := jsruntime.New()
+	if err != nil {
+		return nil, fmt.Errorf("create javascript runtime: %w", err)
+	}
+	defer rt.Close()
+
+	if err := rt.Register("pick", func(args []any) (any, error) {
+		if len(args) != 2 {
+			return nil, fmt.Errorf("host.pick expects 2 arguments: value and selector")
+		}
+
+		selector, ok := args[1].(string)
+		if !ok {
+			return nil, fmt.Errorf("host.pick selector must be a string")
+		}
+
+		value, found, err := selectValue(args[0], selector)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			return nil, nil
+		}
+		return value, nil
+	}); err != nil {
+		return nil, fmt.Errorf("register javascript host pick: %w", err)
+	}
+
+	filename := step.Name + ".js"
+	if strings.TrimSpace(step.Name) == "" {
+		filename = "workflow_transform.js"
+	}
+
+	scriptSource := buildJSTransformScript(step.Body())
+	if err := rt.LoadScript(filename, scriptSource); err != nil {
+		return nil, fmt.Errorf("load javascript transform: %w", err)
+	}
+
+	result, err := rt.Call("run", map[string]any{
+		"input":   source,
+		"vars":    vars,
+		"current": current,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("execute javascript transform: %w", err)
+	}
+
+	if strings.TrimSpace(step.Op) != "" {
+		value, err := applyOperations(result, step.Op)
+		if err != nil {
+			return nil, fmt.Errorf("<transform name=%q> apply operations: %w", step.Name, err)
+		}
+		return value, nil
+	}
+
+	return result, nil
+}
+
+func buildJSTransformScript(source string) string {
+	if strings.Contains(source, "host.export(") {
+		return source
+	}
+
+	return `host.export("run", async (payload) => {
+  const input = payload?.input ?? null;
+  const vars = payload?.vars ?? {};
+  const current = payload?.current ?? null;
+  const pick = async (value, selector) => await host.pick(value, selector);
+  const keys = async (value) => await pick(value, ":keys");
+  const asArray = (value) => Array.isArray(value) ? value : (value == null ? [] : [value]);
+
+` + source + `
+});`
 }
 
 func (e *Executor) resolveValue(step Step, vars map[string]any, current any, allowCurrent bool) (any, error) {

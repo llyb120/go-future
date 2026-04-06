@@ -11,7 +11,7 @@ FROM customers
 WHERE lower(email) = :customerEmailKey;
   ]]></sql>
 
-  <var name="customerId" from="customerRows[0].id" op="int" />
+  <var name="customerId" from="customerRows > :first > id" op="int" />
 
   <sql name="orders" mode="query" engine="gosql" datasource="default"><![CDATA[
 select id, customer_id, order_no, status, created_at
@@ -23,7 +23,7 @@ where customer_id = @customerId
 order by id
   ]]></sql>
 
-  <var name="orderIds" from="orders[*].id" optional="true" default="[]" op="json" />
+  <var name="orderIds" from="orders > id" optional="true" default="[]" op="json" />
 
   <sql name="orderItems" mode="query" engine="gosql" datasource="default"><![CDATA[
 SELECT id, order_id, product_id, quantity, unit_price, quantity * unit_price AS amount
@@ -37,7 +37,7 @@ where
 ORDER BY id;
   ]]></sql>
 
-  <var name="productIds" from="orderItems[*].product_id" optional="true" default="[]" op="json" />
+  <var name="productIds" from="orderItems > product_id" optional="true" default="[]" op="json" />
 
   <sql name="products" mode="query" engine="gosql" datasource="default"><![CDATA[
 SELECT id, name, price
@@ -59,7 +59,7 @@ ORDER BY id;
     <field path="quantity" from="quantity" />
     <field path="unitPrice" from="unit_price" />
     <field path="amount" from="amount" />
-    <field path="product" from="productById.{{product_id}}" />
+    <field path="product" from="productById > {{product_id}}" />
   </transform>
 
   <transform name="itemsByOrder" from="itemsWithProduct" mode="group" by="orderId" />
@@ -69,11 +69,25 @@ ORDER BY id;
     <field path="orderNo" from="order_no" />
     <field path="status" from="status" />
     <field path="createdAt" from="created_at" />
-    <field path="items" from="itemsByOrder.{{id}}" optional="true" default="[]" op="json" />
+    <field path="items" from="itemsByOrder > {{id}}" optional="true" default="[]" op="json" />
   </transform>
 
   <transform name="customerOrderView">
-    <field path="customer" from="customerRows[0]" />
+    <field path="customer" from="customerRows > :first" />
     <field path="orders" from="ordersView" />
   </transform>
+
+  <transform name="customerOrderStats" mode="js" from="customerOrderView"><![CDATA[
+const view = input || { customer: {}, orders: [] };
+const orders = Array.isArray(view.orders) ? view.orders : [];
+const items = orders.flatMap((order) => Array.isArray(order.items) ? order.items : []);
+
+return {
+  customerName: view.customer?.name || "",
+  totalOrders: orders.length,
+  totalItems: items.reduce((sum, item) => sum + (item.quantity || 0), 0),
+  totalAmount: items.reduce((sum, item) => sum + (item.amount || 0), 0),
+  rootKeys: await keys(view),
+};
+  ]]></transform>
 </workflow>

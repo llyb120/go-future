@@ -17,14 +17,14 @@
 }
   ]]></input>
 
-  <var name="tenantCode" from="payload.tenant" op="trim,upper" />
-  <var name="keyword" from="payload.filters.keyword" optional="true" default="" op="trim" />
+  <var name="tenantCode" from="payload > tenant" op="trim,upper" />
+  <var name="keyword" from="payload > filters > keyword" optional="true" default="" op="trim" />
   <var name="keywordLike" template="%{{keyword}}%" />
-  <var name="statusList" from="payload.filters.statuses[*]" optional="true" default="[]" op="json" />
-  <var name="limitNum" from="payload.page.limit" optional="true" default="10" op="int" />
-  <var name="offsetNum" from="payload.page.offset" optional="true" default="0" op="int" />
-  <var name="sortColumn" from="payload.page.sort.column" optional="true" default="id" op="trim,lower,allow(id|name|email|status)" />
-  <var name="sortDirection" from="payload.page.sort.direction" optional="true" default="desc" op="trim,lower,allow(asc|desc)" />
+  <var name="statusList" from="payload > filters > statuses[*]" optional="true" default="[]" op="json" />
+  <var name="limitNum" from="payload > page > limit" optional="true" default="10" op="int" />
+  <var name="offsetNum" from="payload > page > offset" optional="true" default="0" op="int" />
+  <var name="sortColumn" from="payload > page > sort > column" optional="true" default="id" op="trim,lower,allow(id|name|email|status)" />
+  <var name="sortDirection" from="payload > page > sort > direction" optional="true" default="desc" op="trim,lower,allow(asc|desc)" />
 
   <transform name="normalizedRequest">
     <field path="tenant" from="tenantCode" />

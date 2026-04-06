@@ -10,15 +10,17 @@
 - `transform`：把任意结构变成另一种结构
 - `sql`：执行 SQL，支持普通参数化 SQL 和 `gosql` 动态 SQL
 
+详细编制说明见：`docs/workflow-guide.md`
+
 ## 当前能力
 
 - 基于 Go `net/http` 的 Web 页面
 - XML 工作流定义，层级尽量少
 - 支持复杂 JSON 输入
 - 支持路径选择器
-  - `filters.keyword`
-  - `filters.statuses[0]`
-  - `filters.statuses[*]`
+  - `payload > filters > keyword`
+  - `payload > filters > statuses > :eq(0)`
+  - `payload > filters > statuses[*]`
 - 支持结构变换
   - `trim`
   - `upper`
@@ -89,14 +91,21 @@ LIMIT :limitNum;
 }
   ]]></input>
 
-  <var name="tenantCode" from="payload.tenant" op="trim,upper" />
-  <var name="statusList" from="payload.filters.statuses[*]" optional="true" default="[]" op="json" />
-  <transform name="sortColumn" from="payload.page.sort.column" optional="true" default="id" op="trim,lower,allow(id|name|email|status)" />
-  <transform name="sortDirection" from="payload.page.sort.direction" optional="true" default="desc" op="trim,lower,allow(asc|desc)" />
+  <var name="tenantCode" from="payload > tenant" op="trim,upper" />
+  <var name="keyword" from="payload > filters > keyword" optional="true" default="" op="trim" />
+  <var name="keywordLike" template="%{{keyword}}%" />
+  <var name="statusList" from="payload > filters > statuses[*]" optional="true" default="[]" op="json" />
+  <var name="limitNum" from="payload > page > limit" optional="true" default="10" op="int" />
+  <var name="offsetNum" from="payload > page > offset" optional="true" default="0" op="int" />
+  <var name="sortColumn" from="payload > page > sort > column" optional="true" default="id" op="trim,lower,allow(id|name|email|status)" />
+  <var name="sortDirection" from="payload > page > sort > direction" optional="true" default="desc" op="trim,lower,allow(asc|desc)" />
 
   <transform name="normalizedRequest">
     <field path="tenant" from="tenantCode" />
+    <field path="filters.keyword" from="keyword" />
     <field path="filters.statuses" from="statusList" />
+    <field path="page.limit" from="limitNum" />
+    <field path="page.offset" from="offsetNum" />
     <field path="page.sort.column" from="sortColumn" />
     <field path="page.sort.direction" from="sortDirection" />
   </transform>
@@ -124,24 +133,20 @@ offset @offsetNum
 
 ## `pick` 选择器约定
 
-当前实现同时支持兼容的路径写法和更接近 DOM/CSS 的选择器写法：
+当前统一使用更接近 DOM/CSS 的选择器写法：
 
-- 兼容路径风格
-  - `tenant`
-  - `filters.keyword`
-  - `filters.statuses[0]`
-  - `filters.statuses[*]`
-- DOM/CSS 风格
-  - `orders[status=paid] > items > :first > product`
-  - `orders > :eq(1) > status`
-  - `productById:keys`
+- `payload > tenant`
+- `payload > filters > statuses[*]`
+- `orders[status=paid] > items > :first > product`
+- `orders > :eq(1) > status`
+- `productById:keys`
 
 当前支持的选择器子集：
 
 - key 选择器：`orders`、`product`
 - 属性选择器：`[status=paid]`、`[status!=pending]`、`[items]`
 - 伪类：`:first`、`:last`、`:eq(n)`、`:keys`
-- 连接方式：`.`、空格、`>` 都可作为层级连接符
+ - 连接方式：推荐使用空格和 `>`
 
 其中 `:keys` 是扩展伪类，用来获取 map 的全部 key。
 
@@ -194,7 +199,7 @@ FROM customers
 WHERE lower(email) = :customerEmailKey;
   ]]></sql>
 
-  <var name="customerId" from="customerRows[0].id" op="int" />
+  <var name="customerId" from="customerRows > :first > id" op="int" />
 
   <sql name="orders" mode="query" engine="gosql"><![CDATA[
 select id, customer_id, order_no, status, created_at
@@ -206,7 +211,7 @@ where customer_id = @customerId
 order by id
   ]]></sql>
 
-  <var name="orderIds" from="orders[*].id" optional="true" default="[]" op="json" />
+  <var name="orderIds" from="orders > id" optional="true" default="[]" op="json" />
 
   <sql name="orderItems" mode="query" engine="gosql"><![CDATA[
 SELECT id, order_id, product_id, quantity, unit_price, quantity * unit_price AS amount
@@ -220,7 +225,7 @@ where
 ORDER BY id;
   ]]></sql>
 
-  <var name="productIds" from="orderItems[*].product_id" optional="true" default="[]" op="json" />
+  <var name="productIds" from="orderItems > product_id" optional="true" default="[]" op="json" />
 
   <sql name="products" mode="query" engine="gosql"><![CDATA[
 SELECT id, name, price
@@ -240,33 +245,74 @@ ORDER BY id;
     <field path="orderId" from="order_id" />
     <field path="quantity" from="quantity" />
     <field path="amount" from="amount" />
-    <field path="product" from="productById.{{product_id}}" />
+    <field path="product" from="productById > {{product_id}}" />
   </transform>
 
   <transform name="itemsByOrder" from="itemsWithProduct" mode="group" by="orderId" />
   <transform name="ordersView" from="orders" mode="map">
     <field path="id" from="id" />
     <field path="orderNo" from="order_no" />
-    <field path="items" from="itemsByOrder.{{id}}" optional="true" default="[]" op="json" />
+    <field path="items" from="itemsByOrder > {{id}}" optional="true" default="[]" op="json" />
   </transform>
 
   <transform name="customerOrderView">
-    <field path="customer" from="customerRows[0]" />
+    <field path="customer" from="customerRows > :first" />
     <field path="orders" from="ordersView" />
   </transform>
+
+  <transform name="customerOrderStats" mode="js" from="customerOrderView"><![CDATA[
+const view = input || { customer: {}, orders: [] };
+const orders = Array.isArray(view.orders) ? view.orders : [];
+const items = orders.flatMap((order) => Array.isArray(order.items) ? order.items : []);
+
+return {
+  customerName: view.customer?.name || "",
+  totalOrders: orders.length,
+  totalItems: items.reduce((sum, item) => sum + (item.quantity || 0), 0),
+  totalAmount: items.reduce((sum, item) => sum + (item.amount || 0), 0),
+  rootKeys: await keys(view),
+};
+  ]]></transform>
 </workflow>
 ```
 
 这里的思路是：
 
-- 第一条 SQL 先拿到 customer，再从 `customerRows[0].id` 提取 `customerId`
-- 第二条 SQL 用 `customerId` 去查 orders，再从 `orders[*].id` 提取 `orderIds`
-- 第三条 SQL 用 `orderIds` 去查 orderItems，再从 `orderItems[*].product_id` 提取 `productIds`
+- 第一条 SQL 先拿到 customer，再从 `customerRows > :first > id` 提取 `customerId`
+- 第二条 SQL 用 `customerId` 去查 orders，再从 `orders > id` 提取 `orderIds`
+- 第三条 SQL 用 `orderIds` 去查 orderItems，再从 `orderItems > product_id` 提取 `productIds`
 - 第四条 SQL 再用 `productIds` 去查 products
 - `index` 负责把产品列表做成查表字典
 - `map` 负责逐条改结构
 - `group` 负责按外键把子项归并到父级
 - 最后再用一个 `object` 风格的 `transform` 拼成最终返回结果
+- 如果结构处理特别复杂，再用 `transform mode="js"` 做补充
+
+### 4. 特别复杂的处理：交给 JS
+
+当 `object / tree / map / group / index` 还不够时，可以直接用 `transform mode="js"`：
+
+```xml
+<transform name="customerOrderStats" mode="js" from="customerOrderView"><![CDATA[
+const view = input;
+const orders = Array.isArray(view.orders) ? view.orders : [];
+const items = orders.flatMap((order) => order.items || []);
+
+return {
+  totalOrders: orders.length,
+  totalAmount: items.reduce((sum, item) => sum + (item.amount || 0), 0),
+  rootKeys: await keys(view),
+};
+]]></transform>
+```
+
+当前实现参考了你给的 `go-v8-unified-demo` 思路：
+
+- Windows 下运行时启动 Node.js 子进程
+- Go 和 JS 之间只传 JSON 兼容值
+- Workflow 里只写处理代码，不需要自己写 `host.export(...)`
+- Go 会自动把代码包进 `run` 函数，并注入 `input / vars / current`
+- JS 内可以直接用 `await pick(value, selector)` 和 `await keys(value)` 复用 workflow 的选择器
 
 ## `gosql` 说明
 
@@ -312,6 +358,7 @@ go test ./...
 .
 ├─ internal
 │  ├─ data
+│  ├─ jsruntime
 │  ├─ web
 │  └─ workflow
 ├─ workflows

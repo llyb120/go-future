@@ -189,13 +189,13 @@ func TestExecutorRunGoSQLWorkflowWithComplexInput(t *testing.T) {
 			{
 				Kind: "var",
 				Name: "tenantCode",
-				From: "payload.tenant",
+				From: "payload > tenant",
 				Op:   "trim,upper",
 			},
 			{
 				Kind:     "var",
 				Name:     "keyword",
-				From:     "payload.filters.keyword",
+				From:     "payload > filters > keyword",
 				Optional: true,
 				Default:  "",
 				Op:       "trim",
@@ -208,7 +208,7 @@ func TestExecutorRunGoSQLWorkflowWithComplexInput(t *testing.T) {
 			{
 				Kind:     "var",
 				Name:     "statusList",
-				From:     "payload.filters.statuses[*]",
+				From:     "payload > filters > statuses[*]",
 				Optional: true,
 				Default:  "[]",
 				Op:       "json",
@@ -216,7 +216,7 @@ func TestExecutorRunGoSQLWorkflowWithComplexInput(t *testing.T) {
 			{
 				Kind:     "var",
 				Name:     "limitNum",
-				From:     "payload.page.limit",
+				From:     "payload > page > limit",
 				Optional: true,
 				Default:  "10",
 				Op:       "int",
@@ -224,7 +224,7 @@ func TestExecutorRunGoSQLWorkflowWithComplexInput(t *testing.T) {
 			{
 				Kind:     "var",
 				Name:     "offsetNum",
-				From:     "payload.page.offset",
+				From:     "payload > page > offset",
 				Optional: true,
 				Default:  "0",
 				Op:       "int",
@@ -232,7 +232,7 @@ func TestExecutorRunGoSQLWorkflowWithComplexInput(t *testing.T) {
 			{
 				Kind:     "var",
 				Name:     "sortColumn",
-				From:     "payload.page.sort.column",
+				From:     "payload > page > sort > column",
 				Optional: true,
 				Default:  "id",
 				Op:       "trim,lower,allow(id|name|email|status)",
@@ -240,7 +240,7 @@ func TestExecutorRunGoSQLWorkflowWithComplexInput(t *testing.T) {
 			{
 				Kind:     "var",
 				Name:     "sortDirection",
-				From:     "payload.page.sort.direction",
+				From:     "payload > page > sort > direction",
 				Optional: true,
 				Default:  "desc",
 				Op:       "trim,lower,allow(asc|desc)",
@@ -423,7 +423,7 @@ SELECT id, name, email, level
 FROM customers
 WHERE lower(email) = :customerEmailKey;`,
 			},
-			{Kind: "var", Name: "customerId", From: "customerRows[0].id", Op: "int"},
+			{Kind: "var", Name: "customerId", From: "customerRows > :first > id", Op: "int"},
 			{
 				Kind:   "sql",
 				Name:   "orders",
@@ -438,7 +438,7 @@ where customer_id = @customerId
 }
 order by id`,
 			},
-			{Kind: "var", Name: "orderIds", From: "orders[*].id", Optional: true, Default: "[]", Op: "json"},
+			{Kind: "var", Name: "orderIds", From: "orders > id", Optional: true, Default: "[]", Op: "json"},
 			{
 				Kind:   "sql",
 				Name:   "orderItems",
@@ -455,7 +455,7 @@ where
 }
 ORDER BY id;`,
 			},
-			{Kind: "var", Name: "productIds", From: "orderItems[*].product_id", Optional: true, Default: "[]", Op: "json"},
+			{Kind: "var", Name: "productIds", From: "orderItems > product_id", Optional: true, Default: "[]", Op: "json"},
 			{
 				Kind:   "sql",
 				Name:   "products",
@@ -484,7 +484,7 @@ ORDER BY id;`,
 					{Kind: "field", Path: "quantity", From: "quantity"},
 					{Kind: "field", Path: "unitPrice", From: "unit_price"},
 					{Kind: "field", Path: "amount", From: "amount"},
-					{Kind: "field", Path: "product", From: "productById.{{product_id}}"},
+					{Kind: "field", Path: "product", From: "productById > {{product_id}}"},
 				},
 			},
 			{Kind: "transform", Name: "itemsByOrder", From: "itemsWithProduct", Mode: "group", By: "orderId"},
@@ -498,16 +498,34 @@ ORDER BY id;`,
 					{Kind: "field", Path: "orderNo", From: "order_no"},
 					{Kind: "field", Path: "status", From: "status"},
 					{Kind: "field", Path: "createdAt", From: "created_at"},
-					{Kind: "field", Path: "items", From: "itemsByOrder.{{id}}", Optional: true, Default: "[]", Op: "json"},
+					{Kind: "field", Path: "items", From: "itemsByOrder > {{id}}", Optional: true, Default: "[]", Op: "json"},
 				},
 			},
 			{
 				Kind: "transform",
 				Name: "customerOrderView",
 				Children: []Step{
-					{Kind: "field", Path: "customer", From: "customerRows[0]"},
+					{Kind: "field", Path: "customer", From: "customerRows > :first"},
 					{Kind: "field", Path: "orders", From: "ordersView"},
 				},
+			},
+			{
+				Kind: "transform",
+				Name: "customerOrderStats",
+				Mode: "js",
+				From: "customerOrderView",
+				Text: `
+const view = input || { customer: {}, orders: [] };
+const orders = Array.isArray(view.orders) ? view.orders : [];
+const items = orders.flatMap((order) => Array.isArray(order.items) ? order.items : []);
+
+return {
+  customerName: view.customer?.name || "",
+  totalOrders: orders.length,
+  totalItems: items.reduce((sum, item) => sum + (item.quantity || 0), 0),
+  totalAmount: items.reduce((sum, item) => sum + (item.amount || 0), 0),
+  rootKeys: await keys(view),
+};`,
 			},
 		},
 	}
@@ -559,6 +577,25 @@ ORDER BY id;`,
 	product, ok := firstItem["product"].(map[string]any)
 	if !ok || product["name"] != "Copilot Seat" {
 		t.Fatalf("expected first product Copilot Seat, got %#v", firstItem["product"])
+	}
+
+	statsValue, ok := findResolvedParam(result, "customerOrderStats")
+	if !ok {
+		t.Fatalf("expected customerOrderStats to be resolved")
+	}
+
+	stats, ok := statsValue.(map[string]any)
+	if !ok {
+		t.Fatalf("expected customerOrderStats map, got %T", statsValue)
+	}
+
+	if stats["totalOrders"] != float64(1) {
+		t.Fatalf("expected totalOrders 1, got %#v", stats["totalOrders"])
+	}
+
+	rootKeys, ok := stats["rootKeys"].([]any)
+	if !ok || len(rootKeys) != 2 {
+		t.Fatalf("expected root keys from js pick, got %#v", stats["rootKeys"])
 	}
 }
 
