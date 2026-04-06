@@ -1,0 +1,19 @@
+<workflow name="user-search" title="租户用户查询" description="使用内置工具标签做变量整理，然后执行 SQL 查询用户。">
+  <input name="tenant" label="租户编码" required="true" placeholder="例如 acme" description="会先 trim 再 upper，最终变成 SQL 使用的 tenantCode" />
+  <input name="keyword" label="关键字" default="" placeholder="姓名或邮箱，可留空" description="为空时不做模糊过滤" />
+  <input name="limit" label="返回条数" default="10" type="number" placeholder="10" description="先转成整数，再进入 LIMIT" />
+
+  <var name="tenantCode" from="tenant" op="trim,upper" />
+  <var name="keyword" from="keyword" default="" op="trim" />
+  <var name="keywordLike" template="%{{keyword}}%" />
+  <var name="limitNum" from="limit" default="10" op="trim,int" />
+
+  <sql mode="query" datasource="default"><![CDATA[
+SELECT id, tenant, name, email, status
+FROM users
+WHERE tenant = :tenantCode
+  AND (:keyword = '' OR name LIKE :keywordLike OR email LIKE :keywordLike)
+ORDER BY id
+LIMIT :limitNum;
+  ]]></sql>
+</workflow>

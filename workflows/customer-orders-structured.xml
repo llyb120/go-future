@@ -1,0 +1,79 @@
+<workflow name="customer-orders-structured" title="客户订单结构视图" description="使用多条简单 SQL，再由工作流把 customers、orders、order_items、products 组装成结构化结果。">
+  <input name="customerEmail" label="客户邮箱" default="alice.future@demo.ai" />
+  <input name="orderStatus" label="订单状态" default="" placeholder="如 paid，可留空" />
+
+  <var name="customerEmailKey" from="customerEmail" default="alice.future@demo.ai" op="trim,lower" />
+  <var name="orderStatus" from="orderStatus" default="" op="trim,lower" />
+
+  <sql name="customerRows" mode="query" datasource="default"><![CDATA[
+SELECT id, name, email, level
+FROM customers
+WHERE lower(email) = :customerEmailKey;
+  ]]></sql>
+
+  <var name="customerId" from="customerRows[0].id" op="int" />
+
+  <sql name="orders" mode="query" engine="gosql" datasource="default"><![CDATA[
+select id, customer_id, order_no, status, created_at
+from orders
+where customer_id = @customerId
+@if orderStatus != "" {
+  and status = @orderStatus
+}
+order by id
+  ]]></sql>
+
+  <var name="orderIds" from="orders[*].id" optional="true" default="[]" op="json" />
+
+  <sql name="orderItems" mode="query" engine="gosql" datasource="default"><![CDATA[
+SELECT id, order_id, product_id, quantity, unit_price, quantity * unit_price AS amount
+FROM order_items
+where
+@if len(orderIds) > 0 {
+  order_id in (@orderIds)
+} else {
+  1 = 0
+}
+ORDER BY id;
+  ]]></sql>
+
+  <var name="productIds" from="orderItems[*].product_id" optional="true" default="[]" op="json" />
+
+  <sql name="products" mode="query" engine="gosql" datasource="default"><![CDATA[
+SELECT id, name, price
+FROM products
+where
+@if len(productIds) > 0 {
+  id in (@productIds)
+} else {
+  1 = 0
+}
+ORDER BY id;
+  ]]></sql>
+
+  <transform name="productById" from="products" mode="index" by="id" />
+
+  <transform name="itemsWithProduct" from="orderItems" mode="map">
+    <field path="id" from="id" />
+    <field path="orderId" from="order_id" />
+    <field path="quantity" from="quantity" />
+    <field path="unitPrice" from="unit_price" />
+    <field path="amount" from="amount" />
+    <field path="product" from="productById.{{product_id}}" />
+  </transform>
+
+  <transform name="itemsByOrder" from="itemsWithProduct" mode="group" by="orderId" />
+
+  <transform name="ordersView" from="orders" mode="map">
+    <field path="id" from="id" />
+    <field path="orderNo" from="order_no" />
+    <field path="status" from="status" />
+    <field path="createdAt" from="created_at" />
+    <field path="items" from="itemsByOrder.{{id}}" optional="true" default="[]" op="json" />
+  </transform>
+
+  <transform name="customerOrderView">
+    <field path="customer" from="customerRows[0]" />
+    <field path="orders" from="ordersView" />
+  </transform>
+</workflow>

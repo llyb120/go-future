@@ -1,0 +1,9 @@
+<workflow name="category-tree" title="分类树构建" description="先查平铺分类，再通过 transform 直接组 tree。">
+  <sql name="rows" mode="query" datasource="default"><![CDATA[
+SELECT id, parent_id, name
+FROM categories
+ORDER BY id;
+  ]]></sql>
+
+  <transform name="categoryTree" from="rows" mode="tree" id="id" parent="parent_id" children="children" root="0" />
+</workflow>

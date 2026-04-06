@@ -1,0 +1,658 @@
+package workflow
+
+import (
+	"context"
+	"database/sql"
+	"reflect"
+	"strings"
+	"testing"
+
+	"go-ai-future/internal/data"
+
+	_ "modernc.org/sqlite"
+)
+
+func TestExecutorRunQueryWorkflow(t *testing.T) {
+	db := newTestDB(t)
+
+	wf := &Workflow{
+		Name:  "user-search",
+		Title: "User Search",
+		Inputs: []Input{
+			{Name: "tenant", Required: true},
+			{Name: "keyword"},
+			{Name: "limit", Default: "10"},
+		},
+		Steps: []Step{
+			{
+				Kind: "var",
+				Name: "tenantCode",
+				From: "tenant",
+				Op:   "trim,upper",
+			},
+			{
+				Kind:    "var",
+				Name:    "keyword",
+				From:    "keyword",
+				Default: "",
+				Op:      "trim",
+			},
+			{
+				Kind:     "var",
+				Name:     "keywordLike",
+				Template: "%{{keyword}}%",
+			},
+			{
+				Kind:    "var",
+				Name:    "limitNum",
+				From:    "limit",
+				Default: "10",
+				Op:      "trim,int",
+			},
+			{
+				Kind: "sql",
+				Mode: "query",
+				Text: `
+SELECT id, tenant, name, email, status
+FROM users
+WHERE tenant = :tenantCode
+  AND (:keyword = '' OR name LIKE :keywordLike OR email LIKE :keywordLike)
+ORDER BY id
+LIMIT :limitNum;`,
+			},
+		},
+	}
+
+	executor := NewExecutor(map[string]*sql.DB{"default": db})
+
+	result, err := executor.Run(context.Background(), wf, map[string]string{
+		"tenant":  " acme ",
+		"keyword": "Alice",
+		"limit":   "2",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.Query == nil {
+		t.Fatalf("expected query result, got nil")
+	}
+
+	if len(result.Query.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Query.Rows))
+	}
+
+	row := result.Query.Rows[0]
+	if row["name"] != "Alice Zhang" {
+		t.Fatalf("expected Alice Zhang, got %#v", row["name"])
+	}
+
+	if got, ok := findResolvedParam(result, "tenantCode"); !ok || got != "ACME" {
+		t.Fatalf("expected tenantCode to be ACME, got %#v", got)
+	}
+
+	if got, ok := findResolvedParam(result, "limitNum"); !ok || got != int64(2) {
+		t.Fatalf("expected limitNum to be 2, got %#v", got)
+	}
+}
+
+func TestSelectValueSupportsDomStyleSelectors(t *testing.T) {
+	data := map[string]any{
+		"catalog": map[string]any{
+			"orders": []any{
+				map[string]any{
+					"id":     1,
+					"status": "paid",
+					"items": []any{
+						map[string]any{
+							"quantity": 2,
+							"product": map[string]any{
+								"id":   1,
+								"name": "Copilot Seat",
+								"sku":  "seat",
+							},
+						},
+						map[string]any{
+							"quantity": 1,
+							"product": map[string]any{
+								"id":   2,
+								"name": "Workflow Engine",
+								"sku":  "engine",
+							},
+						},
+					},
+				},
+				map[string]any{
+					"id":     2,
+					"status": "pending",
+					"items":  []any{},
+				},
+			},
+			"productById": map[string]any{
+				"1": map[string]any{"name": "Copilot Seat"},
+				"2": map[string]any{"name": "Workflow Engine"},
+			},
+		},
+	}
+
+	keysValue, found, err := selectValue(data, "catalog > orders[status=paid] > items > :first > product:keys")
+	if err != nil {
+		t.Fatalf("selectValue() error = %v", err)
+	}
+	if !found {
+		t.Fatalf("expected keys selector to find a result")
+	}
+
+	keys, ok := keysValue.([]string)
+	if !ok {
+		t.Fatalf("expected keys selector to return []string, got %T", keysValue)
+	}
+	if !reflect.DeepEqual(keys, []string{"id", "name", "sku"}) {
+		t.Fatalf("unexpected keys: %#v", keys)
+	}
+
+	statusValue, found, err := selectValue(data, "catalog > orders > :eq(1) > status")
+	if err != nil {
+		t.Fatalf("selectValue() error = %v", err)
+	}
+	if !found || statusValue != "pending" {
+		t.Fatalf("expected pending status, got %#v", statusValue)
+	}
+
+	productKeysValue, found, err := selectValue(data, "catalog > productById:keys")
+	if err != nil {
+		t.Fatalf("selectValue() error = %v", err)
+	}
+	if !found {
+		t.Fatalf("expected productById:keys to find a result")
+	}
+
+	productKeys, ok := productKeysValue.([]string)
+	if !ok {
+		t.Fatalf("expected productById:keys to return []string, got %T", productKeysValue)
+	}
+	if !reflect.DeepEqual(productKeys, []string{"1", "2"}) {
+		t.Fatalf("unexpected product keys: %#v", productKeys)
+	}
+}
+
+func TestExecutorRunGoSQLWorkflowWithComplexInput(t *testing.T) {
+	db := newTestDB(t)
+
+	wf := &Workflow{
+		Name:  "user-search-advanced",
+		Title: "Advanced User Search",
+		Inputs: []Input{
+			{Name: "payload", Type: "json", Required: true},
+		},
+		Steps: []Step{
+			{
+				Kind: "var",
+				Name: "tenantCode",
+				From: "payload.tenant",
+				Op:   "trim,upper",
+			},
+			{
+				Kind:     "var",
+				Name:     "keyword",
+				From:     "payload.filters.keyword",
+				Optional: true,
+				Default:  "",
+				Op:       "trim",
+			},
+			{
+				Kind:     "var",
+				Name:     "keywordLike",
+				Template: "%{{keyword}}%",
+			},
+			{
+				Kind:     "var",
+				Name:     "statusList",
+				From:     "payload.filters.statuses[*]",
+				Optional: true,
+				Default:  "[]",
+				Op:       "json",
+			},
+			{
+				Kind:     "var",
+				Name:     "limitNum",
+				From:     "payload.page.limit",
+				Optional: true,
+				Default:  "10",
+				Op:       "int",
+			},
+			{
+				Kind:     "var",
+				Name:     "offsetNum",
+				From:     "payload.page.offset",
+				Optional: true,
+				Default:  "0",
+				Op:       "int",
+			},
+			{
+				Kind:     "var",
+				Name:     "sortColumn",
+				From:     "payload.page.sort.column",
+				Optional: true,
+				Default:  "id",
+				Op:       "trim,lower,allow(id|name|email|status)",
+			},
+			{
+				Kind:     "var",
+				Name:     "sortDirection",
+				From:     "payload.page.sort.direction",
+				Optional: true,
+				Default:  "desc",
+				Op:       "trim,lower,allow(asc|desc)",
+			},
+			{
+				Kind: "transform",
+				Name: "normalizedRequest",
+				Children: []Step{
+					{Kind: "field", Path: "tenant", From: "tenantCode"},
+					{Kind: "field", Path: "filters.keyword", From: "keyword"},
+					{Kind: "field", Path: "filters.statuses", From: "statusList"},
+					{Kind: "field", Path: "page.limit", From: "limitNum"},
+					{Kind: "field", Path: "page.offset", From: "offsetNum"},
+					{Kind: "field", Path: "page.sort.column", From: "sortColumn"},
+					{Kind: "field", Path: "page.sort.direction", From: "sortDirection"},
+				},
+			},
+			{
+				Kind:   "sql",
+				Mode:   "query",
+				Engine: "gosql",
+				Text: `
+select id, tenant, name, email, status
+from users
+where tenant = @tenantCode
+@if keyword != "" {
+  and (name like @keywordLike or email like @keywordLike)
+}
+@if len(statusList) > 0 {
+  and status in (@statusList)
+}
+order by @=sortColumn @=sortDirection
+limit @limitNum
+offset @offsetNum`,
+			},
+		},
+	}
+
+	executor := NewExecutor(map[string]*sql.DB{"default": db})
+
+	payload := `{
+  "tenant": "acme",
+  "filters": {
+    "keyword": "alice",
+    "statuses": ["active"]
+  },
+  "page": {
+    "limit": 5,
+    "offset": 0,
+    "sort": {
+      "column": "id",
+      "direction": "desc"
+    }
+  }
+}`
+
+	result, err := executor.Run(context.Background(), wf, map[string]string{
+		"payload": payload,
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.Query == nil {
+		t.Fatalf("expected query result, got nil")
+	}
+
+	if len(result.Query.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Query.Rows))
+	}
+
+	if !strings.Contains(strings.ToLower(result.SQL), "status in") {
+		t.Fatalf("expected rendered SQL to include status filter, got %q", result.SQL)
+	}
+
+	normalized, ok := findResolvedParam(result, "normalizedRequest")
+	if !ok {
+		t.Fatalf("expected normalizedRequest to exist")
+	}
+
+	normalizedMap, ok := normalized.(map[string]any)
+	if !ok {
+		t.Fatalf("expected normalizedRequest to be a map, got %T", normalized)
+	}
+
+	if normalizedMap["tenant"] != "ACME" {
+		t.Fatalf("expected normalizedRequest.tenant to be ACME, got %#v", normalizedMap["tenant"])
+	}
+
+	statuses, ok := findResolvedParam(result, "statusList")
+	if !ok {
+		t.Fatalf("expected statusList to exist")
+	}
+
+	statusSlice, ok := statuses.([]any)
+	if !ok || len(statusSlice) != 1 || statusSlice[0] != "active" {
+		t.Fatalf("expected statusList to contain active, got %#v", statuses)
+	}
+}
+
+func TestExecutorBuildsTreeFromSQLRows(t *testing.T) {
+	db := newTestDB(t)
+
+	wf := &Workflow{
+		Name:  "category-tree",
+		Title: "Category Tree",
+		Steps: []Step{
+			{
+				Kind: "sql",
+				Name: "rows",
+				Mode: "query",
+				Text: `
+SELECT id, parent_id, name
+FROM categories
+ORDER BY id;`,
+			},
+			{
+				Kind:        "transform",
+				Name:        "categoryTree",
+				From:        "rows",
+				Mode:        "tree",
+				IDField:     "id",
+				ParentField: "parent_id",
+				ChildrenKey: "children",
+				Root:        "0",
+			},
+		},
+	}
+
+	executor := NewExecutor(map[string]*sql.DB{"default": db})
+	result, err := executor.Run(context.Background(), wf, map[string]string{})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	treeValue, ok := findResolvedParam(result, "categoryTree")
+	if !ok {
+		t.Fatalf("expected categoryTree to be resolved")
+	}
+
+	tree, ok := treeValue.([]any)
+	if !ok || len(tree) == 0 {
+		t.Fatalf("expected non-empty tree, got %#v", treeValue)
+	}
+
+	rootNode, ok := tree[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected root node map, got %T", tree[0])
+	}
+
+	if rootNode["name"] != "AI" {
+		t.Fatalf("expected root node AI, got %#v", rootNode["name"])
+	}
+
+	children, ok := rootNode["children"].([]any)
+	if !ok || len(children) == 0 {
+		t.Fatalf("expected root children, got %#v", rootNode["children"])
+	}
+}
+
+func TestExecutorBuildsStructuredOrderViewFromRelatedTables(t *testing.T) {
+	db := newTestDB(t)
+
+	wf := &Workflow{
+		Name:  "customer-orders-structured",
+		Title: "Customer Orders Structured",
+		Inputs: []Input{
+			{Name: "customerEmail", Default: "alice.future@demo.ai"},
+			{Name: "orderStatus", Default: ""},
+		},
+		Steps: []Step{
+			{Kind: "var", Name: "customerEmailKey", From: "customerEmail", Default: "alice.future@demo.ai", Op: "trim,lower"},
+			{Kind: "var", Name: "orderStatus", From: "orderStatus", Default: "", Op: "trim,lower"},
+			{
+				Kind: "sql",
+				Name: "customerRows",
+				Mode: "query",
+				Text: `
+SELECT id, name, email, level
+FROM customers
+WHERE lower(email) = :customerEmailKey;`,
+			},
+			{Kind: "var", Name: "customerId", From: "customerRows[0].id", Op: "int"},
+			{
+				Kind:   "sql",
+				Name:   "orders",
+				Mode:   "query",
+				Engine: "gosql",
+				Text: `
+select id, customer_id, order_no, status, created_at
+from orders
+where customer_id = @customerId
+@if orderStatus != "" {
+  and status = @orderStatus
+}
+order by id`,
+			},
+			{Kind: "var", Name: "orderIds", From: "orders[*].id", Optional: true, Default: "[]", Op: "json"},
+			{
+				Kind:   "sql",
+				Name:   "orderItems",
+				Mode:   "query",
+				Engine: "gosql",
+				Text: `
+SELECT id, order_id, product_id, quantity, unit_price, quantity * unit_price AS amount
+FROM order_items
+where
+@if len(orderIds) > 0 {
+  order_id in (@orderIds)
+} else {
+  1 = 0
+}
+ORDER BY id;`,
+			},
+			{Kind: "var", Name: "productIds", From: "orderItems[*].product_id", Optional: true, Default: "[]", Op: "json"},
+			{
+				Kind:   "sql",
+				Name:   "products",
+				Mode:   "query",
+				Engine: "gosql",
+				Text: `
+SELECT id, name, price
+FROM products
+where
+@if len(productIds) > 0 {
+  id in (@productIds)
+} else {
+  1 = 0
+}
+ORDER BY id;`,
+			},
+			{Kind: "transform", Name: "productById", From: "products", Mode: "index", By: "id"},
+			{
+				Kind: "transform",
+				Name: "itemsWithProduct",
+				From: "orderItems",
+				Mode: "map",
+				Children: []Step{
+					{Kind: "field", Path: "id", From: "id"},
+					{Kind: "field", Path: "orderId", From: "order_id"},
+					{Kind: "field", Path: "quantity", From: "quantity"},
+					{Kind: "field", Path: "unitPrice", From: "unit_price"},
+					{Kind: "field", Path: "amount", From: "amount"},
+					{Kind: "field", Path: "product", From: "productById.{{product_id}}"},
+				},
+			},
+			{Kind: "transform", Name: "itemsByOrder", From: "itemsWithProduct", Mode: "group", By: "orderId"},
+			{
+				Kind: "transform",
+				Name: "ordersView",
+				From: "orders",
+				Mode: "map",
+				Children: []Step{
+					{Kind: "field", Path: "id", From: "id"},
+					{Kind: "field", Path: "orderNo", From: "order_no"},
+					{Kind: "field", Path: "status", From: "status"},
+					{Kind: "field", Path: "createdAt", From: "created_at"},
+					{Kind: "field", Path: "items", From: "itemsByOrder.{{id}}", Optional: true, Default: "[]", Op: "json"},
+				},
+			},
+			{
+				Kind: "transform",
+				Name: "customerOrderView",
+				Children: []Step{
+					{Kind: "field", Path: "customer", From: "customerRows[0]"},
+					{Kind: "field", Path: "orders", From: "ordersView"},
+				},
+			},
+		},
+	}
+
+	executor := NewExecutor(map[string]*sql.DB{"default": db})
+	result, err := executor.Run(context.Background(), wf, map[string]string{
+		"customerEmail": "alice.future@demo.ai",
+		"orderStatus":   "paid",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	viewValue, ok := findResolvedParam(result, "customerOrderView")
+	if !ok {
+		t.Fatalf("expected customerOrderView to be resolved")
+	}
+
+	viewMap, ok := viewValue.(map[string]any)
+	if !ok {
+		t.Fatalf("expected structured view map, got %T", viewValue)
+	}
+
+	customer, ok := viewMap["customer"].(map[string]any)
+	if !ok || customer["name"] != "Alice Future" {
+		t.Fatalf("expected customer Alice Future, got %#v", viewMap["customer"])
+	}
+
+	orders, ok := viewMap["orders"].([]any)
+	if !ok || len(orders) != 1 {
+		t.Fatalf("expected one paid order, got %#v", viewMap["orders"])
+	}
+
+	order, ok := orders[0].(map[string]any)
+	if !ok || order["orderNo"] != "SO-1001" {
+		t.Fatalf("expected order SO-1001, got %#v", orders[0])
+	}
+
+	items, ok := order["items"].([]any)
+	if !ok || len(items) != 2 {
+		t.Fatalf("expected two order items, got %#v", order["items"])
+	}
+
+	firstItem, ok := items[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected first item map, got %#v", items[0])
+	}
+
+	product, ok := firstItem["product"].(map[string]any)
+	if !ok || product["name"] != "Copilot Seat" {
+		t.Fatalf("expected first product Copilot Seat, got %#v", firstItem["product"])
+	}
+}
+
+func TestExecutorRunExecWorkflow(t *testing.T) {
+	db := newTestDB(t)
+
+	wf := &Workflow{
+		Name: "activate-user",
+		Inputs: []Input{
+			{Name: "tenant", Required: true},
+			{Name: "email", Required: true},
+		},
+		Steps: []Step{
+			{
+				Kind: "var",
+				Name: "tenantCode",
+				From: "tenant",
+				Op:   "trim,upper",
+			},
+			{
+				Kind: "var",
+				Name: "emailKey",
+				From: "email",
+				Op:   "trim,lower",
+			},
+			{
+				Kind:  "transform",
+				Name:  "statusValue",
+				Value: "active",
+			},
+			{
+				Kind: "sql",
+				Mode: "exec",
+				Text: `
+UPDATE users
+SET status = :statusValue
+WHERE tenant = :tenantCode
+  AND email = :emailKey;`,
+			},
+		},
+	}
+
+	executor := NewExecutor(map[string]*sql.DB{"default": db})
+
+	result, err := executor.Run(context.Background(), wf, map[string]string{
+		"tenant": "labs",
+		"email":  "CAROL@labs.ai",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.Exec == nil {
+		t.Fatalf("expected exec result, got nil")
+	}
+
+	if result.Exec.RowsAffected != 1 {
+		t.Fatalf("expected 1 row affected, got %d", result.Exec.RowsAffected)
+	}
+
+	var status string
+	if err := db.QueryRow(`SELECT status FROM users WHERE email = 'carol@labs.ai'`).Scan(&status); err != nil {
+		t.Fatalf("query status: %v", err)
+	}
+
+	if status != "active" {
+		t.Fatalf("expected status active, got %q", status)
+	}
+}
+
+func newTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+
+	if err := data.EnsureDemoData(context.Background(), db); err != nil {
+		t.Fatalf("bootstrap demo data: %v", err)
+	}
+
+	return db
+}
+
+func findResolvedParam(result *Execution, name string) (any, bool) {
+	for _, item := range result.Resolved {
+		if item.Name == name {
+			return item.Value, true
+		}
+	}
+	return nil, false
+}
