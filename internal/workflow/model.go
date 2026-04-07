@@ -33,6 +33,8 @@ type Input struct {
 type Step struct {
 	Kind        string
 	Name        string
+	Source      string
+	Entry       string
 	From        string
 	Path        string
 	By          string
@@ -105,6 +107,10 @@ func (s *Step) UnmarshalXML(decoder *xml.Decoder, start xml.StartElement) error 
 		switch attr.Name.Local {
 		case "name":
 			s.Name = attr.Value
+		case "src":
+			s.Source = attr.Value
+		case "entry", "function", "call":
+			s.Entry = attr.Value
 		case "from":
 			s.From = attr.Value
 		case "path", "selector", "select":
@@ -190,6 +196,9 @@ func (w *Workflow) Validate() error {
 		if err := validateStep(step, true, w.Name); err != nil {
 			return err
 		}
+		if err := w.validateExternalSources(step); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -240,8 +249,16 @@ func validateStep(step Step, topLevel bool, workflowName string) error {
 			if len(step.Children) > 0 {
 				return fmt.Errorf("<transform mode=js> in workflow %q does not support child steps", workflowName)
 			}
-			if strings.TrimSpace(step.Body()) == "" {
-				return fmt.Errorf("<transform name=%q mode=js> in workflow %q must define script body", step.Name, workflowName)
+			if step.HasInlineBody() && step.HasSourceRef() {
+				return fmt.Errorf("<transform name=%q mode=js> in workflow %q cannot define both src and inline body", step.Name, workflowName)
+			}
+			if !step.HasInlineBody() && !step.HasSourceRef() {
+				return fmt.Errorf("<transform name=%q mode=js> in workflow %q must define script body or src", step.Name, workflowName)
+			}
+			if step.HasInlineBody() {
+				if _, _, err := prepareJSTransformScript(step.Body(), step.Entry); err != nil {
+					return fmt.Errorf("<transform name=%q mode=js> in workflow %q: %w", step.Name, workflowName, err)
+				}
 			}
 			break
 		}
@@ -284,8 +301,11 @@ func validateStep(step Step, topLevel bool, workflowName string) error {
 		if !topLevel {
 			return fmt.Errorf("workflow %q does not allow nested <sql>", workflowName)
 		}
-		if strings.TrimSpace(step.Text) == "" {
-			return fmt.Errorf("workflow %q must define SQL text", workflowName)
+		if step.HasInlineBody() && step.HasSourceRef() {
+			return fmt.Errorf("workflow %q has <sql> that defines both src and inline body", workflowName)
+		}
+		if !step.HasInlineBody() && !step.HasSourceRef() {
+			return fmt.Errorf("workflow %q must define SQL text or src", workflowName)
 		}
 
 		engine := step.NormalizedEngine()
@@ -344,6 +364,14 @@ func (step Step) Body() string {
 	return strings.TrimSpace(step.Text)
 }
 
+func (step Step) HasInlineBody() bool {
+	return strings.TrimSpace(step.Body()) != ""
+}
+
+func (step Step) HasSourceRef() bool {
+	return strings.TrimSpace(step.Source) != ""
+}
+
 func (step Step) TargetPath() string {
 	if strings.TrimSpace(step.Path) != "" {
 		return step.Path
@@ -373,4 +401,29 @@ func (step Step) NormalizedEngine() string {
 		return "plain"
 	}
 	return engine
+}
+
+func (w *Workflow) validateExternalSources(step Step) error {
+	switch {
+	case step.Kind == "sql" && step.HasSourceRef():
+		if _, _, err := resolveStepBody(w, step, "sql"); err != nil {
+			return err
+		}
+	case step.Kind == "transform" && step.TransformMode() == "js" && step.HasSourceRef():
+		body, _, err := resolveStepBody(w, step, "js")
+		if err != nil {
+			return err
+		}
+		if _, _, err := prepareJSTransformScript(body, step.Entry); err != nil {
+			return err
+		}
+	}
+
+	for _, child := range step.Children {
+		if err := w.validateExternalSources(child); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

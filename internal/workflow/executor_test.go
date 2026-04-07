@@ -3,6 +3,8 @@ package workflow
 import (
 	"context"
 	"database/sql"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -173,6 +175,27 @@ func TestSelectValueSupportsDomStyleSelectors(t *testing.T) {
 	}
 	if !reflect.DeepEqual(productKeys, []string{"1", "2"}) {
 		t.Fatalf("unexpected product keys: %#v", productKeys)
+	}
+
+	descendantValue, found, err := selectValue(data, "catalog items product name")
+	if err != nil {
+		t.Fatalf("selectValue() descendant error = %v", err)
+	}
+	if !found {
+		t.Fatalf("expected descendant selector to find products")
+	}
+
+	descendantNames, ok := descendantValue.([]any)
+	if !ok || !reflect.DeepEqual(descendantNames, []any{"Copilot Seat", "Workflow Engine"}) {
+		t.Fatalf("unexpected descendant names: %#v", descendantValue)
+	}
+
+	directOnlyValue, found, err := selectValue(data, "catalog > items")
+	if err != nil {
+		t.Fatalf("selectValue() direct child error = %v", err)
+	}
+	if found || directOnlyValue != nil {
+		t.Fatalf("expected direct child selector to miss nested items, got %#v", directOnlyValue)
 	}
 }
 
@@ -663,6 +686,226 @@ WHERE tenant = :tenantCode
 
 	if status != "active" {
 		t.Fatalf("expected status active, got %q", status)
+	}
+}
+
+func TestExecutorRunSQLFromMarkdownSource(t *testing.T) {
+	db := newTestDB(t)
+	dir := t.TempDir()
+
+	workflowXML := `<workflow name="external-sql" title="External SQL">
+  <input name="tenant" required="true" />
+  <input name="keyword" default="" />
+
+  <var name="tenantCode" from="tenant" op="trim,upper" />
+  <var name="keyword" from="keyword" default="" op="trim" />
+  <var name="keywordLike" template="%{{keyword}}%" />
+
+  <sql name="users" mode="query" engine="gosql" src="snippets\queries.md#active-users" />
+</workflow>`
+
+	markdown := `# snippets
+
+## active-users
+
+` + "```sql" + `
+select id, tenant, name, email, status
+from users
+where tenant = @tenantCode
+@if keyword != "" {
+  and (name like @keywordLike or email like @keywordLike)
+}
+order by id
+` + "```" + `
+`
+
+	workflowPath := filepath.Join(dir, "external-sql.xml")
+	markdownPath := filepath.Join(dir, "snippets", "queries.md")
+
+	if err := os.MkdirAll(filepath.Dir(markdownPath), 0o755); err != nil {
+		t.Fatalf("mkdir snippets: %v", err)
+	}
+	if err := os.WriteFile(workflowPath, []byte(workflowXML), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+	if err := os.WriteFile(markdownPath, []byte(markdown), 0o644); err != nil {
+		t.Fatalf("write markdown: %v", err)
+	}
+
+	catalog, err := LoadDir(dir)
+	if err != nil {
+		t.Fatalf("LoadDir() error = %v", err)
+	}
+
+	wf, ok := catalog.Get("external-sql")
+	if !ok {
+		t.Fatalf("expected workflow external-sql")
+	}
+
+	executor := NewExecutor(map[string]*sql.DB{"default": db})
+	result, err := executor.Run(context.Background(), wf, map[string]string{
+		"tenant":  "acme",
+		"keyword": "alice",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.Query == nil || len(result.Query.Rows) != 1 {
+		t.Fatalf("expected 1 query row, got %#v", result.Query)
+	}
+
+	if got := result.Query.Rows[0]["name"]; got != "Alice Zhang" {
+		t.Fatalf("expected Alice Zhang, got %#v", got)
+	}
+}
+
+func TestExecutorRunJSFromExternalFile(t *testing.T) {
+	db := newTestDB(t)
+	dir := t.TempDir()
+
+	workflowXML := `<workflow name="external-js" title="External JS">
+  <input name="customerEmail" default="alice.future@demo.ai" />
+
+  <var name="customerEmailKey" from="customerEmail" default="alice.future@demo.ai" op="trim,lower" />
+
+  <sql name="customerRows" mode="query"><![CDATA[
+SELECT id, name, email
+FROM customers
+WHERE lower(email) = :customerEmailKey;
+  ]]></sql>
+
+  <transform name="customerSummary" mode="js" from="customerRows > :first" src="scripts\customer-summary.js" entry="customerSummary" />
+</workflow>`
+
+	script := `export function selectedEmail({ input }) {
+  return input?.email || "";
+}
+
+export async function customerSummary({ input, keys }) {
+  return {
+    name: input?.name || "",
+    email: selectedEmail({ input }),
+    keys: await keys(input),
+  };
+}`
+
+	workflowPath := filepath.Join(dir, "external-js.xml")
+	scriptPath := filepath.Join(dir, "scripts", "customer-summary.js")
+
+	if err := os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
+		t.Fatalf("mkdir scripts: %v", err)
+	}
+	if err := os.WriteFile(workflowPath, []byte(workflowXML), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	catalog, err := LoadDir(dir)
+	if err != nil {
+		t.Fatalf("LoadDir() error = %v", err)
+	}
+
+	wf, ok := catalog.Get("external-js")
+	if !ok {
+		t.Fatalf("expected workflow external-js")
+	}
+
+	executor := NewExecutor(map[string]*sql.DB{"default": db})
+	result, err := executor.Run(context.Background(), wf, map[string]string{
+		"customerEmail": "alice.future@demo.ai",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	value, ok := findResolvedParam(result, "customerSummary")
+	if !ok {
+		t.Fatalf("expected customerSummary resolved param")
+	}
+
+	summary, ok := value.(map[string]any)
+	if !ok {
+		t.Fatalf("expected summary map, got %T", value)
+	}
+
+	if summary["name"] != "Alice Future" {
+		t.Fatalf("expected summary name Alice Future, got %#v", summary["name"])
+	}
+
+	keys, ok := summary["keys"].([]any)
+	if !ok || len(keys) != 3 {
+		t.Fatalf("expected 3 keys, got %#v", summary["keys"])
+	}
+}
+
+func TestLoadDirRejectsMultiExportJSWithoutEntry(t *testing.T) {
+	dir := t.TempDir()
+
+	workflowXML := `<workflow name="bad-external-js" title="Bad JS Source">
+  <transform name="summary" mode="js" src="scripts\summary.js" />
+</workflow>`
+
+	script := `export function first() {
+  return { ok: true };
+}
+
+export function second() {
+  return { ok: false };
+}`
+
+	workflowPath := filepath.Join(dir, "bad-external-js.xml")
+	scriptPath := filepath.Join(dir, "scripts", "summary.js")
+
+	if err := os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
+		t.Fatalf("mkdir scripts: %v", err)
+	}
+	if err := os.WriteFile(workflowPath, []byte(workflowXML), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	_, err := LoadDir(dir)
+	if err == nil {
+		t.Fatalf("expected LoadDir() to reject multi-export js without entry")
+	}
+	if !strings.Contains(err.Error(), "exports multiple functions") {
+		t.Fatalf("expected multi-export entry error, got %v", err)
+	}
+}
+
+func TestLoadDirRejectsNonMarkdownExternalSQL(t *testing.T) {
+	dir := t.TempDir()
+
+	workflowXML := `<workflow name="bad-external-sql" title="Bad SQL Source">
+  <sql name="users" mode="query" src="snippets\queries.sql" />
+</workflow>`
+
+	sqlText := `select id, name from users;`
+
+	workflowPath := filepath.Join(dir, "bad-external-sql.xml")
+	sqlPath := filepath.Join(dir, "snippets", "queries.sql")
+
+	if err := os.MkdirAll(filepath.Dir(sqlPath), 0o755); err != nil {
+		t.Fatalf("mkdir snippets: %v", err)
+	}
+	if err := os.WriteFile(workflowPath, []byte(workflowXML), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+	if err := os.WriteFile(sqlPath, []byte(sqlText), 0o644); err != nil {
+		t.Fatalf("write sql file: %v", err)
+	}
+
+	_, err := LoadDir(dir)
+	if err == nil {
+		t.Fatalf("expected LoadDir() to reject non-markdown sql source")
+	}
+	if !strings.Contains(err.Error(), "must be a markdown file") {
+		t.Fatalf("expected markdown source error, got %v", err)
 	}
 }
 

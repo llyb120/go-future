@@ -12,7 +12,7 @@ import (
 
 	"go-ai-future/internal/data"
 	"go-ai-future/internal/web"
-	"go-ai-future/internal/workflow"
+	"go-ai-future/workflow"
 
 	_ "modernc.org/sqlite"
 )

@@ -292,12 +292,24 @@ product
 - 空格
 - `>`
 
+语义分别是：
+
+- `>`：只匹配直属下一层
+- 空格：匹配任意后代层级
+
 例如：
 
 ```text
 payload > filters > keyword
 customerRows > :first > id
+catalog items product name
 ```
+
+注意：
+
+- 同一层级不要把空格和 `>` 混成一种语义
+- `catalog > items` 与 `catalog items` 的结果可能完全不同
+- 当前不再推荐旧的点号分隔写法
 
 ### 7.3 属性选择器
 
@@ -512,7 +524,53 @@ return {
 - 不需要自己写 `host.export(...)`
 - 系统会自动包装成可执行函数
 
-### 8.8 JS 中可用的变量和辅助函数
+### 8.8 JS 外部源码引用
+
+如果不想把 JS 直接写进 XML，可以使用 `src`：
+
+```xml
+<transform name="customerOrderStats" mode="js" from="customerOrderView" src="scripts\customer-order-stats.js" entry="customerOrderStats" />
+```
+
+规则：
+
+- `src` 路径默认相对于当前 workflow XML 文件
+- 支持直接引用：
+  - `.js`
+  - `.mjs`
+  - `.cjs`
+  - `.md`
+- 如果使用 Markdown：
+  - 系统会查找 `js` 或 `javascript` fenced code block
+  - `src="xxx.md#heading-name"` 时，会优先在对应标题下找代码块
+- `src` 与内嵌 `<![CDATA[...]]>` 二选一，不能同时写
+- 如果一个文件导出多个函数，需要通过 `entry` 指定入口函数
+
+外部 JS 支持两种写法：
+
+1. 文件里只写一个处理体，系统自动包装成默认入口
+2. 文件里写多个 `export function` / `export async function`，再由 `entry` 选择本次调用哪个
+
+示例：
+
+```js
+export function collectItems({ input, asArray }) {
+  return asArray(input?.orders).flatMap((order) => asArray(order?.items));
+}
+
+export async function customerOrderStats({ input, keys, asArray }) {
+  const view = input || { customer: {}, orders: [] };
+  const orders = asArray(view.orders);
+
+  return {
+    totalOrders: orders.length,
+    totalItems: collectItems({ input: view, asArray }).length,
+    rootKeys: await keys(view),
+  };
+}
+```
+
+### 8.9 JS 中可用的变量和辅助函数
 
 当前 JS transform 默认注入：
 
@@ -535,7 +593,7 @@ return {
 - `asArray(value)`
   - 方便把单值或空值规整成数组
 
-### 8.9 JS transform 的约束
+### 8.10 JS transform 的约束
 
 - 当前实现参考 `go-v8-unified-demo`
 - Windows 下通过 **Node.js 子进程** 执行
@@ -607,7 +665,46 @@ return {
 - `datasource`
   - 当前默认是 `default`
 
-### 10.2 多 SQL 的依赖链
+### 10.2 外部 SQL 引用
+
+如果 SQL 很长，或者你想把 SQL 和 workflow 拆开维护，可以给 `sql` 配 `src`：
+
+```xml
+<sql name="orders" mode="query" engine="gosql" src="snippets\customer-orders.md#orders-by-customer" />
+```
+
+当前支持：
+
+- `.md`
+- `.markdown`
+
+规则：
+
+- `src` 路径默认相对于当前 workflow XML 文件
+- `src` 与内嵌 SQL 二选一，不能同时写
+- 外部 SQL 只从 Markdown 读取，这样与 `gosql` 的官方组织方式一致
+- 如果引用 Markdown：
+  - 只读取 `sql` fenced code block
+  - 是否按 `gosql` 语法执行，由当前 `<sql>` 的 `engine` 属性决定
+  - `src="xxx.md#heading-name"` 时，会优先在对应标题下找代码块
+
+Markdown 片段示例：
+
+````md
+## orders-by-customer
+
+```sql
+select id, customer_id, order_no, status, created_at
+from orders
+where customer_id = @customerId
+@if orderStatus != "" {
+  and status = @orderStatus
+}
+order by id
+```
+````
+
+### 10.3 多 SQL 的依赖链
 
 当前系统允许在一个 workflow 里写多个 SQL。
 
@@ -622,7 +719,7 @@ return {
 
 这就是当前 `customer-orders-structured` 的组织方式。
 
-### 10.3 SQL 结果变量的形态
+### 10.4 SQL 结果变量的形态
 
 `query` 结果写入变量时，形态是：
 
@@ -636,7 +733,7 @@ return {
 - 所有 id：`rows > id`
 - 某行的字段：`rows > :first > id`
 
-### 10.4 普通 SQL 与 `gosql`
+### 10.5 普通 SQL 与 `gosql`
 
 普通 SQL 适合：
 
@@ -657,6 +754,7 @@ return {
 
 ```text
 workflows/customer-orders-structured.xml
+workflows/customer-orders-external.xml
 ```
 
 这个示例完整演示了：
@@ -666,6 +764,7 @@ workflows/customer-orders-structured.xml
 - `index / map / group / object` 组数
 - `transform mode="js"` 做复杂统计
 - `:keys` 伪类在 JS 里复用
+- 把 SQL 和 JS 拆到 XML 外部
 
 它的依赖链是：
 
@@ -774,6 +873,9 @@ ADDR=:18080 go run .
 
 - `customer-orders-structured.xml`
   - 多 SQL 依赖链 + workflow 组数 + JS summary
+
+- `customer-orders-external.xml`
+  - 与上面同一个主题，但把 SQL 放到 Markdown，把 JS 放到独立脚本
 
 ---
 

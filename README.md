@@ -39,6 +39,9 @@
 - `sql` 支持两种模式
   - 普通 SQL：命名参数 `:tenantCode`
   - `gosql`：动态条件、循环、表达式和安全参数化
+- `sql` 和 `transform mode="js"` 都支持 `src`
+  - 可以继续内嵌
+  - 也可以引用外部 `.js` / `.md`
 - 默认使用 SQLite，开箱可跑
 
 ## XML 设计
@@ -131,6 +134,56 @@ offset @offsetNum
 - `transform` 更适合把已有值重组成新结构，尤其适合 `object` 和 `tree`
 - `sql` 只负责真正的数据库执行
 
+## 外部源码引用
+
+为了避免把大段 SQL 和 JS 全塞在 XML 里，现在 `sql` 与 `transform mode="js"` 都支持 `src`。
+
+### 1. 外部 SQL
+
+```xml
+<sql name="orders" mode="query" engine="gosql" src="snippets\customer-orders.md#orders-by-customer" />
+```
+
+支持：
+
+- `.md`
+
+SQL 外链只支持 Markdown，因为 `gosql` 本身就是以 Markdown 代码块为入口。
+
+如果引用的是 Markdown：
+
+- 用 fenced code block 保存 SQL
+- `#片段名` 会匹配 Markdown 标题
+- `gosql` 官方约定里只解析 `sql` fenced code block
+- 是否按 `gosql` 语法执行，由 `<sql engine="gosql" ... />` 决定
+
+### 2. 外部 JS
+
+```xml
+<transform name="customerOrderStats" mode="js" from="customerOrderView" src="scripts\customer-order-stats.js" entry="customerOrderStats" />
+```
+
+如果文件里只有一个处理逻辑，可以继续直接写处理代码；如果一个文件里要复用多个入口，可以导出多个函数，再用 `entry` 指定本次调用哪个：
+
+```js
+export function collectItems({ input, asArray }) {
+  return asArray(input?.orders).flatMap((order) => asArray(order?.items));
+}
+
+export async function customerOrderStats({ input, keys, asArray }) {
+  const view = input || { customer: {}, orders: [] };
+  const orders = asArray(view.orders);
+
+  return {
+    totalOrders: orders.length,
+    totalItems: collectItems({ input: view, asArray }).length,
+    rootKeys: await keys(view),
+  };
+}
+```
+
+`src` 路径默认相对于当前 workflow XML 文件；原来的内嵌 `<![CDATA[...]]>` 写法继续可用。若文件里只导出一个函数，`entry` 可以省略；导出多个时需要显式指定。
+
 ## `pick` 选择器约定
 
 当前统一使用更接近 DOM/CSS 的选择器写法：
@@ -146,7 +199,10 @@ offset @offsetNum
 - key 选择器：`orders`、`product`
 - 属性选择器：`[status=paid]`、`[status!=pending]`、`[items]`
 - 伪类：`:first`、`:last`、`:eq(n)`、`:keys`
- - 连接方式：推荐使用空格和 `>`
+- 连接方式：
+  - `>`：直属
+  - 空格：跨层级后代查找
+  - 同一层级不要把两种分隔符混成一种语义
 
 其中 `:keys` 是扩展伪类，用来获取 map 的全部 key。
 
@@ -327,6 +383,49 @@ return {
 
 当前示例里通过 `allow(...)` 先把排序字段和方向规整后，再交给 `@=` 输出，避免把未校验输入直接拼进 SQL。
 
+## 作为库使用
+
+现在外部项目可以直接引用公开包：
+
+```go
+import (
+  "context"
+  "database/sql"
+
+  wf "go-ai-future/workflow"
+)
+
+catalog, err := wf.LoadDir("workflows")
+if err != nil {
+  panic(err)
+}
+
+executor := wf.NewExecutor(map[string]*sql.DB{
+  "default": db,
+})
+
+selected, ok := catalog.Get("customer-orders-external")
+if !ok {
+  panic("workflow not found")
+}
+
+result, err := executor.Run(context.Background(), selected, map[string]string{
+  "customerEmail": "alice.future@demo.ai",
+})
+if err != nil {
+  panic(err)
+}
+
+_ = result
+```
+
+如果 workflow XML 不是放在目录里，也可以直接用：
+
+- `workflow.LoadFile(path)`
+- `workflow.Parse(content, sourcePath)`
+- `workflow.ParseString(content, sourcePath)`
+- `workflow.NewCatalog(...)`
+
 ## 本地运行
 
 ```bash
@@ -339,12 +438,13 @@ go run .
 http://localhost:8080
 ```
 
-页面里现在有四个示例工作流：
+页面里现在有五个示例工作流：
 
 - `user-search`：简单变量整理 + 普通 SQL
 - `user-search-advanced`：复杂 JSON 输入 + 简化后的声明式结构重组 + `gosql`
 - `category-tree`：先查平铺分类，再直接组 tree
 - `customer-orders-structured`：多表关联后返回带结构的客户订单视图
+- `customer-orders-external`：把 SQL 拆到 Markdown、把 JS 拆到独立脚本
 
 ## 测试
 

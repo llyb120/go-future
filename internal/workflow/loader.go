@@ -24,35 +24,71 @@ func LoadDir(dir string) (*Catalog, error) {
 		return nil, fmt.Errorf("no workflow xml files found in %s", dir)
 	}
 
-	catalog := &Catalog{
-		list:   make([]*Workflow, 0, len(matches)),
-		byName: make(map[string]*Workflow, len(matches)),
+	workflows := make([]*Workflow, 0, len(matches))
+	for _, file := range matches {
+		wf, err := LoadFile(file)
+		if err != nil {
+			return nil, err
+		}
+		workflows = append(workflows, wf)
 	}
 
-	for _, file := range matches {
-		content, err := os.ReadFile(file)
-		if err != nil {
-			return nil, fmt.Errorf("read workflow file %s: %w", file, err)
+	return NewCatalog(workflows...)
+}
+
+func LoadFile(path string) (*Workflow, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read workflow file %s: %w", path, err)
+	}
+
+	wf, err := Parse(content, path)
+	if err != nil {
+		return nil, fmt.Errorf("load workflow file %s: %w", path, err)
+	}
+
+	return wf, nil
+}
+
+func Parse(content []byte, sourcePath string) (*Workflow, error) {
+	var wf Workflow
+	if err := xml.Unmarshal(content, &wf); err != nil {
+		return nil, fmt.Errorf("parse workflow xml: %w", err)
+	}
+
+	wf.SourcePath = sourcePath
+	wf.RawXML = string(content)
+
+	if err := wf.Validate(); err != nil {
+		return nil, err
+	}
+
+	return &wf, nil
+}
+
+func ParseString(content string, sourcePath string) (*Workflow, error) {
+	return Parse([]byte(content), sourcePath)
+}
+
+func NewCatalog(workflows ...*Workflow) (*Catalog, error) {
+	catalog := &Catalog{
+		list:   make([]*Workflow, 0, len(workflows)),
+		byName: make(map[string]*Workflow, len(workflows)),
+	}
+
+	for _, wf := range workflows {
+		if wf == nil {
+			return nil, fmt.Errorf("catalog contains nil workflow")
 		}
-
-		var wf Workflow
-		if err := xml.Unmarshal(content, &wf); err != nil {
-			return nil, fmt.Errorf("parse workflow file %s: %w", file, err)
-		}
-
-		wf.SourcePath = file
-		wf.RawXML = string(content)
-
 		if err := wf.Validate(); err != nil {
-			return nil, fmt.Errorf("validate workflow file %s: %w", file, err)
+			return nil, fmt.Errorf("validate workflow %q: %w", wf.Name, err)
 		}
-
 		if _, exists := catalog.byName[wf.Name]; exists {
 			return nil, fmt.Errorf("duplicate workflow name %q", wf.Name)
 		}
 
-		catalog.byName[wf.Name] = &wf
-		catalog.list = append(catalog.list, &wf)
+		catalog.byName[wf.Name] = wf
+		catalog.list = append(catalog.list, wf)
 	}
 
 	sort.Slice(catalog.list, func(i, j int) bool {

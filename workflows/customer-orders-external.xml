@@ -1,0 +1,50 @@
+<workflow name="customer-orders-external" title="客户订单结构视图（外部源码）" description="SQL 从 Markdown 代码块引用，JS 从独立脚本引用，演示如何让工作流 XML 保持简洁。">
+  <input name="customerEmail" label="客户邮箱" default="alice.future@demo.ai" />
+  <input name="orderStatus" label="订单状态" default="" placeholder="如 paid，可留空" />
+
+  <var name="customerEmailKey" from="customerEmail" default="alice.future@demo.ai" op="trim,lower" />
+  <var name="orderStatus" from="orderStatus" default="" op="trim,lower" />
+
+  <sql name="customerRows" mode="query" src="snippets\customer-orders.md#customer-rows" />
+
+  <var name="customerId" from="customerRows > :first > id" op="int" />
+
+  <sql name="orders" mode="query" engine="gosql" src="snippets\customer-orders.md#orders-by-customer" />
+
+  <var name="orderIds" from="orders > id" optional="true" default="[]" op="json" />
+
+  <sql name="orderItems" mode="query" engine="gosql" src="snippets\customer-orders.md#order-items-by-order-ids" />
+
+  <var name="productIds" from="orderItems > product_id" optional="true" default="[]" op="json" />
+
+  <sql name="products" mode="query" engine="gosql" src="snippets\customer-orders.md#products-by-product-ids" />
+
+  <transform name="productById" from="products" mode="index" by="id" />
+
+  <transform name="itemsWithProduct" from="orderItems" mode="map">
+    <field path="id" from="id" />
+    <field path="orderId" from="order_id" />
+    <field path="productId" from="product_id" />
+    <field path="quantity" from="quantity" />
+    <field path="unitPrice" from="unit_price" />
+    <field path="amount" from="amount" />
+    <field path="product" from="productById > {{product_id}}" optional="true" />
+  </transform>
+
+  <transform name="itemsByOrder" from="itemsWithProduct" mode="group" by="orderId" />
+
+  <transform name="ordersView" from="orders" mode="map">
+    <field path="id" from="id" />
+    <field path="orderNo" from="order_no" />
+    <field path="status" from="status" />
+    <field path="createdAt" from="created_at" />
+    <field path="items" from="itemsByOrder > {{id}}" optional="true" default="[]" op="json" />
+  </transform>
+
+  <transform name="customerOrderView">
+    <field path="customer" from="customerRows > :first" />
+    <field path="orders" from="ordersView" />
+  </transform>
+
+  <transform name="customerOrderStats" mode="js" from="customerOrderView" src="scripts\customer-order-stats.js" entry="customerOrderStats" />
+</workflow>

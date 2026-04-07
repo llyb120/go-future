@@ -19,6 +19,7 @@ import (
 var (
 	templateVarPattern = regexp.MustCompile(`\{\{\s*([^{}]+?)\s*\}\}`)
 	sqlParamPattern    = regexp.MustCompile(`:([A-Za-z_][A-Za-z0-9_]*)`)
+	jsExportPattern    = regexp.MustCompile(`(?m)^\s*export\s+(async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(`)
 )
 
 type Executor struct {
@@ -51,11 +52,12 @@ type ExecResult struct {
 }
 
 type selectorToken struct {
-	kind  string
-	key   string
-	index int
-	op    string
-	value string
+	kind     string
+	key      string
+	index    int
+	op       string
+	value    string
+	relation string
 }
 
 func NewExecutor(dbs map[string]*sql.DB) *Executor {
@@ -97,7 +99,7 @@ func (e *Executor) Run(ctx context.Context, wf *Workflow, incoming map[string]st
 	}
 
 	for _, step := range wf.Steps {
-		if err := e.executeStep(ctx, step, vars, execution); err != nil {
+		if err := e.executeStep(ctx, wf, step, vars, execution); err != nil {
 			return nil, err
 		}
 	}
@@ -128,10 +130,10 @@ func parseInputValue(input Input, raw string) (any, error) {
 	}
 }
 
-func (e *Executor) executeStep(ctx context.Context, step Step, vars map[string]any, execution *Execution) error {
+func (e *Executor) executeStep(ctx context.Context, wf *Workflow, step Step, vars map[string]any, execution *Execution) error {
 	switch step.Kind {
 	case "var":
-		value, err := e.evaluateVar(step, vars)
+		value, err := e.evaluateVar(wf, step, vars)
 		if err != nil {
 			return err
 		}
@@ -143,7 +145,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, vars map[string]a
 		}
 		vars[step.Name] = value
 	case "transform":
-		value, err := e.evaluateTransform(step, vars, nil)
+		value, err := e.evaluateTransform(wf, step, vars, nil)
 		if err != nil {
 			return err
 		}
@@ -155,7 +157,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, vars map[string]a
 		}
 		vars[step.Name] = value
 	case "sql":
-		return e.executeSQL(ctx, step, vars, execution)
+		return e.executeSQL(ctx, wf, step, vars, execution)
 	default:
 		return fmt.Errorf("unsupported step <%s>", step.Kind)
 	}
@@ -163,7 +165,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, vars map[string]a
 	return nil
 }
 
-func (e *Executor) evaluateVar(step Step, vars map[string]any) (any, error) {
+func (e *Executor) evaluateVar(wf *Workflow, step Step, vars map[string]any) (any, error) {
 	if len(step.Children) == 0 {
 		return e.resolveValue(step, vars, nil, false)
 	}
@@ -179,7 +181,7 @@ func (e *Executor) evaluateVar(step Step, vars map[string]any) (any, error) {
 		case "pick":
 			next, err = e.evaluatePick(child, vars, current)
 		case "transform":
-			next, err = e.evaluateTransform(child, vars, current)
+			next, err = e.evaluateTransform(wf, child, vars, current)
 		case "set":
 			next, err = e.evaluateLegacySet(child, vars)
 		default:
@@ -270,7 +272,7 @@ func (e *Executor) evaluatePick(step Step, vars map[string]any, current any) (an
 	return value, nil
 }
 
-func (e *Executor) evaluateTransform(step Step, vars map[string]any, current any) (any, error) {
+func (e *Executor) evaluateTransform(wf *Workflow, step Step, vars map[string]any, current any) (any, error) {
 	switch step.TransformMode() {
 	case "object":
 		return e.evaluateObjectTransform(step, vars, current)
@@ -281,7 +283,7 @@ func (e *Executor) evaluateTransform(step Step, vars map[string]any, current any
 	case "index":
 		return e.evaluateIndexTransform(step, vars, current)
 	case "js":
-		return e.evaluateJSTransform(step, vars, current)
+		return e.evaluateJSTransform(wf, step, vars, current)
 	case "tree":
 		return e.evaluateTreeTransform(step, vars, current)
 	default:
@@ -534,7 +536,7 @@ func (e *Executor) evaluateTreeTransform(step Step, vars map[string]any, current
 	return tree, nil
 }
 
-func (e *Executor) evaluateJSTransform(step Step, vars map[string]any, current any) (any, error) {
+func (e *Executor) evaluateJSTransform(wf *Workflow, step Step, vars map[string]any, current any) (any, error) {
 	source, err := e.resolveValue(Step{
 		From:     step.From,
 		Value:    step.Value,
@@ -579,12 +581,20 @@ func (e *Executor) evaluateJSTransform(step Step, vars map[string]any, current a
 		filename = "workflow_transform.js"
 	}
 
-	scriptSource := buildJSTransformScript(step.Body())
+	scriptBody, _, err := resolveStepBody(wf, step, "js")
+	if err != nil {
+		return nil, err
+	}
+
+	scriptSource, entryName, err := prepareJSTransformScript(scriptBody, step.Entry)
+	if err != nil {
+		return nil, err
+	}
 	if err := rt.LoadScript(filename, scriptSource); err != nil {
 		return nil, fmt.Errorf("load javascript transform: %w", err)
 	}
 
-	result, err := rt.Call("run", map[string]any{
+	result, err := rt.Call(entryName, map[string]any{
 		"input":   source,
 		"vars":    vars,
 		"current": current,
@@ -604,12 +614,25 @@ func (e *Executor) evaluateJSTransform(step Step, vars map[string]any, current a
 	return result, nil
 }
 
-func buildJSTransformScript(source string) string {
+func prepareJSTransformScript(source string, entry string) (string, string, error) {
+	entry = strings.TrimSpace(entry)
+
 	if strings.Contains(source, "host.export(") {
-		return source
+		if entry == "" {
+			entry = "run"
+		}
+		return source, entry, nil
 	}
 
-	return `host.export("run", async (payload) => {
+	if strings.Contains(source, "export ") {
+		return buildExportedJSTransformScript(source, entry)
+	}
+
+	if entry == "" {
+		entry = "run"
+	}
+
+	return `host.export("` + entry + `", async (payload) => {
   const input = payload?.input ?? null;
   const vars = payload?.vars ?? {};
   const current = payload?.current ?? null;
@@ -618,7 +641,68 @@ func buildJSTransformScript(source string) string {
   const asArray = (value) => Array.isArray(value) ? value : (value == null ? [] : [value]);
 
 ` + source + `
-});`
+});`, entry, nil
+}
+
+func buildExportedJSTransformScript(source string, entry string) (string, string, error) {
+	matches := jsExportPattern.FindAllStringSubmatch(source, -1)
+	if len(matches) == 0 {
+		return "", "", fmt.Errorf("javascript source contains export syntax but no supported exported function declaration")
+	}
+
+	exportedNames := make([]string, 0, len(matches))
+	seen := make(map[string]struct{}, len(matches))
+	for _, match := range matches {
+		if len(match) < 3 {
+			continue
+		}
+		name := strings.TrimSpace(match[2])
+		if name == "" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		exportedNames = append(exportedNames, name)
+	}
+
+	if entry == "" {
+		if len(exportedNames) != 1 {
+			return "", "", fmt.Errorf("javascript source exports multiple functions; please specify entry")
+		}
+		entry = exportedNames[0]
+	} else if _, exists := seen[entry]; !exists {
+		return "", "", fmt.Errorf("javascript source does not export function %q", entry)
+	}
+
+	transformedSource := jsExportPattern.ReplaceAllString(source, "${1}function ${2}(")
+
+	var exportBuilder strings.Builder
+	exportBuilder.WriteString(`const workflowPick = async (value, selector) => await host.pick(value, selector);
+const workflowKeys = async (value) => await workflowPick(value, ":keys");
+const workflowAsArray = (value) => Array.isArray(value) ? value : (value == null ? [] : [value]);
+
+`)
+	exportBuilder.WriteString(transformedSource)
+	exportBuilder.WriteString("\n\n")
+
+	for _, name := range exportedNames {
+		exportBuilder.WriteString(`host.export("`)
+		exportBuilder.WriteString(name)
+		exportBuilder.WriteString(`", async (payload) => await `)
+		exportBuilder.WriteString(name)
+		exportBuilder.WriteString(`({
+  input: payload?.input ?? null,
+  vars: payload?.vars ?? {},
+  current: payload?.current ?? null,
+  pick: workflowPick,
+  keys: workflowKeys,
+  asArray: workflowAsArray,
+}));` + "\n")
+	}
+
+	return exportBuilder.String(), entry, nil
 }
 
 func (e *Executor) resolveValue(step Step, vars map[string]any, current any, allowCurrent bool) (any, error) {
@@ -671,7 +755,7 @@ func (e *Executor) resolveValue(step Step, vars map[string]any, current any, all
 	return value, nil
 }
 
-func (e *Executor) executeSQL(ctx context.Context, step Step, vars map[string]any, execution *Execution) error {
+func (e *Executor) executeSQL(ctx context.Context, wf *Workflow, step Step, vars map[string]any, execution *Execution) error {
 	datasource := step.Datasource
 	if datasource == "" {
 		datasource = "default"
@@ -683,16 +767,23 @@ func (e *Executor) executeSQL(ctx context.Context, step Step, vars map[string]an
 	}
 
 	var (
-		sqlText string
-		args    []any
-		err     error
+		sourceLanguage string
+		sourceText     string
+		sqlText        string
+		args           []any
+		err            error
 	)
 
-	switch step.NormalizedEngine() {
+	sourceText, sourceLanguage, err = resolveStepBody(wf, step, "sql")
+	if err != nil {
+		return err
+	}
+
+	switch effectiveSQLEngine(step, sourceLanguage) {
 	case "gosql":
-		sqlText, args, err = renderGoSQL(step, vars)
+		sqlText, args, err = renderGoSQL(sourceText, vars)
 	default:
-		sqlText = strings.TrimSpace(step.Text)
+		sqlText = strings.TrimSpace(sourceText)
 		args, err = plainSQLArgs(sqlText, vars)
 	}
 	if err != nil {
@@ -753,10 +844,10 @@ func (e *Executor) executeSQL(ctx context.Context, step Step, vars map[string]an
 	return nil
 }
 
-func renderGoSQL(step Step, vars map[string]any) (string, []any, error) {
+func renderGoSQL(sourceText string, vars map[string]any) (string, []any, error) {
 	engine := gosql.New()
 
-	markdown := "# workflow\n## main\n```sql\n" + strings.TrimSpace(step.Text) + "\n```\n"
+	markdown := "# workflow\n## main\n```sql\n" + strings.TrimSpace(sourceText) + "\n```\n"
 	if err := engine.LoadMarkdown(markdown); err != nil {
 		return "", nil, fmt.Errorf("load gosql template: %w", err)
 	}
@@ -871,16 +962,34 @@ func parseSelector(selector string) ([]selectorToken, error) {
 	}
 
 	tokens := make([]selectorToken, 0)
+	pendingRelation := ""
+	sawToken := false
+
 	for index := 0; index < len(selector); {
-		switch selector[index] {
-		case '.', ' ', '\t', '\r', '\n':
-			index++
-		case '>':
-			index++
-			for index < len(selector) && selector[index] == ' ' {
+		switch {
+		case isSelectorSpace(selector[index]):
+			for index < len(selector) && isSelectorSpace(selector[index]) {
 				index++
 			}
-		case '[':
+			if index < len(selector) && selector[index] == '>' {
+				continue
+			}
+			if sawToken && pendingRelation == "" {
+				pendingRelation = "descendant"
+			}
+		case selector[index] == '>':
+			if !sawToken {
+				return nil, fmt.Errorf("selector %q cannot start with >", selector)
+			}
+			if pendingRelation != "" {
+				return nil, fmt.Errorf("selector %q has mixed separators at the same level", selector)
+			}
+			pendingRelation = "child"
+			index++
+			for index < len(selector) && isSelectorSpace(selector[index]) {
+				index++
+			}
+		case selector[index] == '[':
 			content, nextIndex, err := readSelectorGroup(selector, index, '[', ']')
 			if err != nil {
 				return nil, err
@@ -889,30 +998,46 @@ func parseSelector(selector string) ([]selectorToken, error) {
 			if err != nil {
 				return nil, err
 			}
+			token.relation = pendingRelation
 			tokens = append(tokens, token)
 			index = nextIndex
-		case ':':
+			pendingRelation = ""
+			sawToken = true
+		case selector[index] == ':':
 			name, arg, nextIndex, err := parsePseudoSelector(selector, index)
 			if err != nil {
 				return nil, err
 			}
 			tokens = append(tokens, selectorToken{
-				kind:  "pseudo",
-				key:   name,
-				value: arg,
+				kind:     "pseudo",
+				key:      name,
+				value:    arg,
+				relation: pendingRelation,
 			})
 			index = nextIndex
+			pendingRelation = ""
+			sawToken = true
 		default:
 			start := index
-			for index < len(selector) && !strings.ContainsRune(".[>: \t\r\n", rune(selector[index])) {
+			for index < len(selector) && !strings.ContainsRune("[>: \t\r\n", rune(selector[index])) {
 				index++
 			}
 
 			key := strings.TrimSpace(selector[start:index])
 			if key != "" {
-				tokens = append(tokens, selectorToken{kind: "field", key: key})
+				tokens = append(tokens, selectorToken{
+					kind:     "field",
+					key:      key,
+					relation: pendingRelation,
+				})
+				pendingRelation = ""
+				sawToken = true
 			}
 		}
+	}
+
+	if pendingRelation != "" {
+		return nil, fmt.Errorf("selector %q cannot end with a separator", selector)
 	}
 
 	return tokens, nil
@@ -924,23 +1049,41 @@ func walkSelection(value any, tokens []selectorToken) (any, bool, error) {
 	}
 
 	token := tokens[0]
+	if token.relation == "descendant" {
+		includeCurrent := token.kind == "field" && !isSelectorSequence(value)
+		return walkDescendantSelection(value, token, tokens[1:], includeCurrent)
+	}
+
+	return walkTokenMatch(value, token, tokens[1:])
+}
+
+func applySelectorToken(value any, token selectorToken) (any, bool, error) {
 	switch token.kind {
 	case "field":
-		next, ok, err := applyFieldSelector(value, token.key)
-		if err != nil {
-			return nil, false, err
-		}
-		if !ok {
-			return nil, false, nil
-		}
-		return walkSelection(next, tokens[1:])
+		return applyFieldSelector(value, token.key)
 	case "index":
 		items, ok := toSlice(value)
 		if !ok || token.index < 0 || token.index >= len(items) {
 			return nil, false, nil
 		}
-		return walkSelection(items[token.index], tokens[1:])
+		return items[token.index], true, nil
 	case "wildcard":
+		items, ok := toSlice(value)
+		if !ok {
+			return nil, false, nil
+		}
+		return items, true, nil
+	case "attr":
+		return applyAttributeSelector(value, token.key, token.op, token.value)
+	case "pseudo":
+		return applyPseudoSelector(value, token.key, token.value)
+	default:
+		return nil, false, fmt.Errorf("unsupported selector token kind %q", token.kind)
+	}
+}
+
+func walkTokenMatch(value any, token selectorToken, remaining []selectorToken) (any, bool, error) {
+	if token.kind == "wildcard" {
 		items, ok := toSlice(value)
 		if !ok {
 			return nil, false, nil
@@ -950,7 +1093,7 @@ func walkSelection(value any, tokens []selectorToken) (any, bool, error) {
 		foundAny := false
 
 		for _, item := range items {
-			next, ok, err := walkSelection(item, tokens[1:])
+			next, ok, err := walkSelection(item, remaining)
 			if err != nil {
 				return nil, false, err
 			}
@@ -971,27 +1114,133 @@ func walkSelection(value any, tokens []selectorToken) (any, bool, error) {
 		}
 
 		return result, true, nil
-	case "attr":
-		next, ok, err := applyAttributeSelector(value, token.key, token.op, token.value)
-		if err != nil {
-			return nil, false, err
-		}
-		if !ok {
-			return nil, false, nil
-		}
-		return walkSelection(next, tokens[1:])
-	case "pseudo":
-		next, ok, err := applyPseudoSelector(value, token.key, token.value)
-		if err != nil {
-			return nil, false, err
-		}
-		if !ok {
-			return nil, false, nil
-		}
-		return walkSelection(next, tokens[1:])
-	default:
-		return nil, false, fmt.Errorf("unsupported selector token kind %q", token.kind)
 	}
+
+	next, ok, err := applySelectorToken(value, token)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		return nil, false, nil
+	}
+
+	return walkSelection(next, remaining)
+}
+
+func walkDescendantSelection(value any, token selectorToken, remaining []selectorToken, allowCurrentMatch bool) (any, bool, error) {
+	matches := make([]any, 0)
+	foundAny := false
+
+	if allowCurrentMatch && (token.kind != "field" || !isSelectorSequence(value)) {
+		nextToken := selectorToken{
+			kind:  token.kind,
+			key:   token.key,
+			index: token.index,
+			op:    token.op,
+			value: token.value,
+		}
+
+		next, ok, err := walkTokenMatch(value, nextToken, remaining)
+		if err != nil {
+			return nil, false, err
+		}
+		if ok {
+			foundAny = true
+			matches = appendSelectorMatches(matches, next)
+		}
+	}
+
+	children := selectorChildren(value)
+	if len(children) == 0 {
+		if !foundAny {
+			return nil, false, nil
+		}
+		if len(matches) == 1 {
+			return matches[0], true, nil
+		}
+		return matches, true, nil
+	}
+
+	for _, child := range children {
+		nested, ok, err := walkDescendantSelection(child, token, remaining, true)
+		if err != nil {
+			return nil, false, err
+		}
+		if ok {
+			foundAny = true
+			matches = appendSelectorMatches(matches, nested)
+		}
+	}
+
+	if !foundAny {
+		return nil, false, nil
+	}
+
+	if len(matches) == 1 {
+		return matches[0], true, nil
+	}
+
+	return matches, true, nil
+}
+
+func appendSelectorMatches(target []any, value any) []any {
+	if nested, ok := value.([]any); ok {
+		return append(target, nested...)
+	}
+	return append(target, value)
+}
+
+func selectorChildren(value any) []any {
+	if value == nil {
+		return nil
+	}
+
+	current := reflect.ValueOf(value)
+	for current.Kind() == reflect.Pointer || current.Kind() == reflect.Interface {
+		if current.IsNil() {
+			return nil
+		}
+		current = current.Elem()
+	}
+
+	switch current.Kind() {
+	case reflect.Map:
+		if current.Type().Key().Kind() != reflect.String {
+			return nil
+		}
+
+		keys := make([]string, 0, current.Len())
+		for _, key := range current.MapKeys() {
+			keys = append(keys, key.String())
+		}
+		sort.Strings(keys)
+
+		children := make([]any, 0, len(keys))
+		for _, key := range keys {
+			child := current.MapIndex(reflect.ValueOf(key))
+			if child.IsValid() {
+				children = append(children, child.Interface())
+			}
+		}
+		return children
+	case reflect.Struct:
+		children := make([]any, 0, current.NumField())
+		for index := 0; index < current.NumField(); index++ {
+			fieldValue := current.Field(index)
+			if fieldValue.CanInterface() {
+				children = append(children, fieldValue.Interface())
+			}
+		}
+		return children
+	default:
+		children, _ := toSlice(value)
+		return children
+	}
+}
+
+func isSelectorSequence(value any) bool {
+	_, ok := toSlice(value)
+	return ok
 }
 
 func readSelectorGroup(input string, start int, open, close byte) (string, int, error) {
@@ -1080,6 +1329,10 @@ func parsePseudoSelector(input string, start int) (string, string, int, error) {
 
 func isSelectorNameChar(char byte) bool {
 	return (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '_'
+}
+
+func isSelectorSpace(char byte) bool {
+	return char == ' ' || char == '\t' || char == '\r' || char == '\n'
 }
 
 func trimSelectorQuotes(input string) string {
