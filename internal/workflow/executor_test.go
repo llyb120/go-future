@@ -9,15 +9,10 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-
-	"github.com/llyb120/go-future/internal/data"
-
-	_ "modernc.org/sqlite"
+	"testing/fstest"
 )
 
 func TestExecutorRunQueryWorkflow(t *testing.T) {
-	db := newTestDB(t)
-
 	wf := &Workflow{
 		Name:  "user-search",
 		Title: "User Search",
@@ -66,12 +61,16 @@ LIMIT :limitNum;`,
 		},
 	}
 
-	executor := NewExecutor(map[string]*sql.DB{"default": db})
+	executor := newTestExecutor(t)
 
-	result, err := executor.Run(context.Background(), wf, map[string]string{
-		"tenant":  " acme ",
-		"keyword": "Alice",
-		"limit":   "2",
+	result, err := executor.Run(context.Background(), wf, struct {
+		Tenant  string
+		Keyword string
+		Limit   int
+	}{
+		Tenant:  " acme ",
+		Keyword: "Alice",
+		Limit:   2,
 	})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
@@ -96,6 +95,146 @@ LIMIT :limitNum;`,
 
 	if got, ok := findResolvedParam(result, "limitNum"); !ok || got != int64(2) {
 		t.Fatalf("expected limitNum to be 2, got %#v", got)
+	}
+
+	scopeValue, ok := result.GetScope("tenantCode")
+	if !ok || scopeValue != "ACME" {
+		t.Fatalf("expected scope tenantCode to be ACME, got %#v", scopeValue)
+	}
+
+	lastValue, ok := result.GetResult()
+	if !ok || lastValue == nil {
+		t.Fatalf("expected last result to exist, got %#v", lastValue)
+	}
+}
+
+func TestLoadDirFSSupportsEmbeddedResources(t *testing.T) {
+	fsys := fstest.MapFS{
+		"workflows/report/report.xml": {
+			Data: []byte(`<workflow name="embedded-report" title="Embedded Report">
+  <input name="tenant" required="true" />
+  <sql name="rows" mode="query" src="reports.by-tenant" />
+  <transform name="summary" mode="js" from="rows > :first" entry="buildSummary" />
+</workflow>`),
+		},
+		"workflows/report/res/reports.sql.md": {
+			Data: []byte(`# reports
+
+## by-tenant
+` + "```sql" + `
+SELECT :tenant AS tenant, '1' AS value;
+` + "```"),
+		},
+		"workflows/report/res/summary.js": {
+			Data: []byte(`export function buildSummary({ input }) {
+  return {
+    tenant: input?.tenant || "",
+    value: input?.value || "",
+  };
+}`),
+		},
+	}
+
+	catalog, err := LoadDirFS(fsys, "workflows")
+	if err != nil {
+		t.Fatalf("LoadDirFS() error = %v", err)
+	}
+
+	wf, ok := catalog.Get("embedded-report")
+	if !ok {
+		t.Fatalf("expected embedded-report workflow")
+	}
+
+	executor := NewExecutorWithSQLExecutors(nil, map[string]SQLExecutor{
+		"default": SQLExecutorFunc(func(ctx context.Context, request SQLRequest) ([]map[string]string, error) {
+			if request.SQL != "SELECT :tenant AS tenant, '1' AS value;" {
+				t.Fatalf("unexpected SQL: %q", request.SQL)
+			}
+			if len(request.Args) != 1 {
+				t.Fatalf("expected one argument, got %#v", request.Args)
+			}
+			named, ok := request.Args[0].(sql.NamedArg)
+			if !ok || named.Name != "tenant" || named.Value != "acme" {
+				t.Fatalf("expected named arg tenant=acme, got %#v", request.Args[0])
+			}
+			return []map[string]string{
+				{"tenant": "acme", "value": "1"},
+			}, nil
+		}),
+	})
+
+	result, err := executor.Run(context.Background(), wf, map[string]string{
+		"tenant": "acme",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	summaryValue, ok := findResolvedParam(result, "summary")
+	if !ok {
+		t.Fatalf("expected summary result")
+	}
+
+	summary, ok := summaryValue.(map[string]any)
+	if !ok {
+		t.Fatalf("expected summary map, got %T", summaryValue)
+	}
+	if summary["tenant"] != "acme" {
+		t.Fatalf("expected tenant=acme, got %#v", summary["tenant"])
+	}
+	if summary["value"] != float64(1) {
+		t.Fatalf("expected value=1, got %#v", summary["value"])
+	}
+}
+
+func TestExecutorUsesCustomSQLExecutor(t *testing.T) {
+	wf := &Workflow{
+		Name:  "custom-sql",
+		Title: "Custom SQL",
+		Inputs: []Input{
+			{Name: "tenant", Required: true},
+		},
+		Steps: []Step{
+			{Kind: "sql", Name: "rows", Mode: "query", Datasource: "framework", Text: `SELECT :tenant AS tenant;`},
+			{Kind: "var", Name: "tenantName", From: "rows > :first > tenant"},
+		},
+	}
+
+	called := 0
+	executor := NewExecutorWithSQLExecutors(nil, map[string]SQLExecutor{
+		"framework": SQLExecutorFunc(func(ctx context.Context, request SQLRequest) ([]map[string]string, error) {
+			called++
+			if request.Datasource != "framework" {
+				t.Fatalf("expected datasource framework, got %q", request.Datasource)
+			}
+			if request.SQL != "SELECT :tenant AS tenant;" {
+				t.Fatalf("unexpected SQL: %q", request.SQL)
+			}
+			if len(request.Args) != 1 {
+				t.Fatalf("expected one argument, got %#v", request.Args)
+			}
+			named, ok := request.Args[0].(sql.NamedArg)
+			if !ok || named.Name != "tenant" || named.Value != "acme" {
+				t.Fatalf("expected named arg tenant=acme, got %#v", request.Args[0])
+			}
+			return []map[string]string{
+				{"tenant": "acme"},
+			}, nil
+		}),
+	})
+
+	result, err := executor.Run(context.Background(), wf, map[string]string{
+		"tenant": "acme",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if called != 1 {
+		t.Fatalf("expected custom SQL executor to be called once, got %d", called)
+	}
+	if got, ok := findResolvedParam(result, "tenantName"); !ok || got != "acme" {
+		t.Fatalf("expected tenantName=acme, got %#v", got)
 	}
 }
 
@@ -201,8 +340,6 @@ func TestSelectValueSupportsDomStyleSelectors(t *testing.T) {
 }
 
 func TestExecutorRunGoSQLWorkflowWithComplexInput(t *testing.T) {
-	db := newTestDB(t)
-
 	wf := &Workflow{
 		Name:  "user-search-advanced",
 		Title: "Advanced User Search",
@@ -246,26 +383,22 @@ offset @offsetNum`,
 		},
 	}
 
-	executor := NewExecutor(map[string]*sql.DB{"default": db})
+	executor := newTestExecutor(t)
 
-	payload := `{
-  "tenant": "acme",
-  "filters": {
-    "keyword": "alice",
-    "statuses": ["active"]
-  },
-  "page": {
-    "limit": 5,
-    "offset": 0,
-    "sort": {
-      "column": "id",
-      "direction": "desc"
-    }
-  }
-}`
-
-	result, err := executor.Run(context.Background(), wf, map[string]string{
-		"payload": payload,
+	result, err := executor.Run(context.Background(), wf, map[string]any{
+		"tenant": "acme",
+		"filters": map[string]any{
+			"keyword":  "alice",
+			"statuses": []string{"active"},
+		},
+		"page": map[string]any{
+			"limit":  5,
+			"offset": 0,
+			"sort": map[string]any{
+				"column":    "id",
+				"direction": "desc",
+			},
+		},
 	})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
@@ -308,9 +441,60 @@ offset @offsetNum`,
 	}
 }
 
-func TestExecutorBuildsTreeFromSQLRows(t *testing.T) {
-	db := newTestDB(t)
+func TestExecutorRunAcceptsStructAsSingleJSONInput(t *testing.T) {
+	wf := &Workflow{
+		Name: "json-payload",
+		Inputs: []Input{
+			{Name: "payload", Type: "json", Required: true},
+		},
+		Steps: []Step{
+			{Kind: "var", Name: "tenantCode", From: "payload > tenant", Op: "trim,upper"},
+		},
+	}
 
+	executor := newTestExecutor(t)
+	result, err := executor.Run(context.Background(), wf, struct {
+		Tenant string
+	}{
+		Tenant: "acme",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if got, ok := findResolvedParam(result, "tenantCode"); !ok || got != "ACME" {
+		t.Fatalf("expected tenantCode to be ACME, got %#v", got)
+	}
+}
+
+func TestExecutionGetResultPrefersAtResult(t *testing.T) {
+	wf := &Workflow{
+		Name: "explicit-result",
+		Steps: []Step{
+			{Kind: "var", Name: "first", Value: "first"},
+			{Kind: "var", Name: "@result", Value: "picked"},
+			{Kind: "var", Name: "last", Value: "last"},
+		},
+	}
+
+	executor := newTestExecutor(t)
+	result, err := executor.Run(context.Background(), wf, nil)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	value, ok := result.GetScope("@result")
+	if !ok || value != "picked" {
+		t.Fatalf("expected scope @result to be picked, got %#v", value)
+	}
+
+	finalValue, ok := result.GetResult()
+	if !ok || finalValue != "picked" {
+		t.Fatalf("expected GetResult() to prefer @result, got %#v", finalValue)
+	}
+}
+
+func TestExecutorBuildsTreeFromSQLRows(t *testing.T) {
 	wf := &Workflow{
 		Name:  "category-tree",
 		Title: "Category Tree",
@@ -337,7 +521,7 @@ ORDER BY id;`,
 		},
 	}
 
-	executor := NewExecutor(map[string]*sql.DB{"default": db})
+	executor := newTestExecutor(t)
 	result, err := executor.Run(context.Background(), wf, map[string]string{})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
@@ -369,8 +553,6 @@ ORDER BY id;`,
 }
 
 func TestExecutorBuildsStructuredOrderViewFromRelatedTables(t *testing.T) {
-	db := newTestDB(t)
-
 	wf := &Workflow{
 		Name:  "customer-orders-structured",
 		Title: "Customer Orders Structured",
@@ -497,7 +679,7 @@ return {
 		},
 	}
 
-	executor := NewExecutor(map[string]*sql.DB{"default": db})
+	executor := newTestExecutor(t)
 	result, err := executor.Run(context.Background(), wf, map[string]string{
 		"customerEmail": "alice.future@demo.ai",
 		"orderStatus":   "paid",
@@ -567,7 +749,7 @@ return {
 }
 
 func TestExecutorRunExecWorkflow(t *testing.T) {
-	db := newTestDB(t)
+	db := newExecTestDB(t)
 
 	wf := &Workflow{
 		Name: "activate-user",
@@ -634,7 +816,6 @@ WHERE tenant = :tenantCode
 }
 
 func TestExecutorRunSQLFromMarkdownSource(t *testing.T) {
-	db := newTestDB(t)
 	dir := t.TempDir()
 
 	workflowXML := `<workflow name="external-sql" title="External SQL">
@@ -686,7 +867,7 @@ order by id
 		t.Fatalf("expected workflow external-sql")
 	}
 
-	executor := NewExecutor(map[string]*sql.DB{"default": db})
+	executor := newTestExecutor(t)
 	result, err := executor.Run(context.Background(), wf, map[string]string{
 		"tenant":  "acme",
 		"keyword": "alice",
@@ -705,7 +886,6 @@ order by id
 }
 
 func TestExecutorRunSQLNamedSourceIgnoresPlainMarkdown(t *testing.T) {
-	db := newTestDB(t)
 	dir := t.TempDir()
 
 	workflowXML := `<workflow name="external-sql" title="External SQL">
@@ -738,22 +918,9 @@ order by id
 		t.Fatalf("write markdown: %v", err)
 	}
 
-	catalog, err := LoadDir(dir)
-	if err != nil {
-		t.Fatalf("LoadDir() error = %v", err)
-	}
-
-	wf, ok := catalog.Get("external-sql")
-	if !ok {
-		t.Fatalf("expected workflow external-sql")
-	}
-
-	executor := NewExecutor(map[string]*sql.DB{"default": db})
-	_, err = executor.Run(context.Background(), wf, map[string]string{
-		"tenant": "acme",
-	})
+	_, err := LoadDir(dir)
 	if err == nil {
-		t.Fatalf("expected Run() to reject plain markdown preload")
+		t.Fatalf("expected LoadDir() to reject plain markdown preload")
 	}
 	if !strings.Contains(err.Error(), `sql source "snippets.active-users" not found in preloaded markdown resources`) {
 		t.Fatalf("expected named sql preload error, got %v", err)
@@ -761,7 +928,6 @@ order by id
 }
 
 func TestExecutorRunPreloadedJSFunction(t *testing.T) {
-	db := newTestDB(t)
 	dir := t.TempDir()
 
 	workflowXML := `<workflow name="external-js" title="External JS">
@@ -813,7 +979,7 @@ export async function customerSummary({ input, keys }) {
 		t.Fatalf("expected workflow external-js")
 	}
 
-	executor := NewExecutor(map[string]*sql.DB{"default": db})
+	executor := newTestExecutor(t)
 	result, err := executor.Run(context.Background(), wf, map[string]string{
 		"customerEmail": "alice.future@demo.ai",
 	})
@@ -910,7 +1076,6 @@ func TestLoadDirRejectsNonMarkdownExternalSQL(t *testing.T) {
 }
 
 func TestLoadDirSupportsNestedWorkflowFolders(t *testing.T) {
-	db := newTestDB(t)
 	dir := t.TempDir()
 
 	alphaWorkflow := `<workflow name="alpha-report" title="Alpha Report">
@@ -973,7 +1138,7 @@ SELECT 2 AS value;
 		t.Fatalf("LoadDir() error = %v", err)
 	}
 
-	executor := NewExecutor(map[string]*sql.DB{"default": db})
+	executor := newTestExecutor(t)
 	for _, expected := range []struct {
 		name   string
 		source string
@@ -1012,7 +1177,6 @@ SELECT 2 AS value;
 }
 
 func TestLoadDirSharesResFolderAcrossWorkflowXMLInSameDirectory(t *testing.T) {
-	db := newTestDB(t)
 	dir := t.TempDir()
 
 	reportWorkflow := `<workflow name="folder-report" title="Folder Report">
@@ -1063,7 +1227,7 @@ SELECT 9 AS value;
 		t.Fatalf("LoadDir() error = %v", err)
 	}
 
-	executor := NewExecutor(map[string]*sql.DB{"default": db})
+	executor := newTestExecutor(t)
 	for _, expected := range []struct {
 		name  string
 		value int64
@@ -1095,25 +1259,6 @@ SELECT 9 AS value;
 			t.Fatalf("expected %s value %d, got %#v", expected.name, expected.value, summary["value"])
 		}
 	}
-}
-
-func newTestDB(t *testing.T) *sql.DB {
-	t.Helper()
-
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-
-	t.Cleanup(func() {
-		_ = db.Close()
-	})
-
-	if err := data.EnsureDemoData(context.Background(), db); err != nil {
-		t.Fatalf("bootstrap demo data: %v", err)
-	}
-
-	return db
 }
 
 func findResolvedParam(result *Execution, name string) (any, bool) {

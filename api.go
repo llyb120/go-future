@@ -1,11 +1,9 @@
 package future
 
 import (
-	"context"
 	"database/sql"
+	"io/fs"
 
-	"github.com/llyb120/go-future/internal/data"
-	"github.com/llyb120/go-future/internal/web"
 	engine "github.com/llyb120/go-future/internal/workflow"
 )
 
@@ -18,19 +16,32 @@ type Execution = engine.Execution
 type ResolvedParam = engine.ResolvedParam
 type QueryResult = engine.QueryResult
 type ExecResult = engine.ExecResult
-type Server = web.Server
-type PageData = web.PageData
+type SQLRequest = engine.SQLRequest
+type SQLExecutor = engine.SQLExecutor
+type SQLExecutorFunc = engine.SQLExecutorFunc
 
 func NewExecutor(dbs map[string]*sql.DB) *Executor {
 	return engine.NewExecutor(dbs)
+}
+
+func NewExecutorWithSQLExecutors(dbs map[string]*sql.DB, executors map[string]SQLExecutor) *Executor {
+	return engine.NewExecutorWithSQLExecutors(dbs, executors)
 }
 
 func LoadDir(dir string) (*Catalog, error) {
 	return engine.LoadDir(dir)
 }
 
+func LoadDirFS(fsys fs.FS, dir string) (*Catalog, error) {
+	return engine.LoadDirFS(fsys, dir)
+}
+
 func LoadFile(path string) (*Workflow, error) {
 	return engine.LoadFile(path)
+}
+
+func LoadFileFS(fsys fs.FS, path string) (*Workflow, error) {
+	return engine.LoadFileFS(fsys, path)
 }
 
 func Parse(content []byte, sourcePath string) (*Workflow, error) {
@@ -43,12 +54,4 @@ func ParseString(content string, sourcePath string) (*Workflow, error) {
 
 func NewCatalog(workflows ...*Workflow) (*Catalog, error) {
 	return engine.NewCatalog(workflows...)
-}
-
-func NewServer(catalog *Catalog, executor *Executor) (*Server, error) {
-	return web.NewServer(catalog, executor)
-}
-
-func EnsureDemoData(ctx context.Context, db *sql.DB) error {
-	return data.EnsureDemoData(ctx, db)
 }

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/llyb120/go-future/internal/jsruntime"
 
@@ -24,7 +25,8 @@ var (
 )
 
 type Executor struct {
-	dbs map[string]*sql.DB
+	dbs          map[string]*sql.DB
+	sqlExecutors map[string]SQLExecutor
 }
 
 type Execution struct {
@@ -35,6 +37,9 @@ type Execution struct {
 	Resolved      []ResolvedParam
 	Query         *QueryResult
 	Exec          *ExecResult
+	scope         map[string]any
+	lastResult    any
+	lastResultSet bool
 }
 
 type ResolvedParam struct {
@@ -52,6 +57,61 @@ type ExecResult struct {
 	LastInsertID int64
 }
 
+type SQLRequest struct {
+	Workflow   *Workflow
+	Step       Step
+	Datasource string
+	SQL        string
+	Args       []any
+}
+
+type SQLExecutor interface {
+	Query(ctx context.Context, request SQLRequest) ([]map[string]string, error)
+}
+
+type SQLExecutorFunc func(ctx context.Context, request SQLRequest) ([]map[string]string, error)
+
+func (fn SQLExecutorFunc) Query(ctx context.Context, request SQLRequest) ([]map[string]string, error) {
+	return fn(ctx, request)
+}
+
+func (e *Execution) GetScope(name string) (any, bool) {
+	if e == nil {
+		return nil, false
+	}
+
+	if e.scope != nil {
+		value, ok := e.scope[name]
+		if ok {
+			return value, true
+		}
+	}
+
+	for _, item := range e.Resolved {
+		if item.Name == name {
+			return item.Value, true
+		}
+	}
+
+	return nil, false
+}
+
+func (e *Execution) GetResult() (any, bool) {
+	if e == nil {
+		return nil, false
+	}
+
+	if value, ok := e.GetScope("@result"); ok {
+		return value, true
+	}
+
+	if e.lastResultSet {
+		return e.lastResult, true
+	}
+
+	return nil, false
+}
+
 type selectorToken struct {
 	kind     string
 	key      string
@@ -62,15 +122,27 @@ type selectorToken struct {
 }
 
 func NewExecutor(dbs map[string]*sql.DB) *Executor {
+	return NewExecutorWithSQLExecutors(dbs, nil)
+}
+
+func NewExecutorWithSQLExecutors(dbs map[string]*sql.DB, executors map[string]SQLExecutor) *Executor {
 	copied := make(map[string]*sql.DB, len(dbs))
 	for name, db := range dbs {
 		copied[name] = db
 	}
 
-	return &Executor{dbs: copied}
+	hooks := make(map[string]SQLExecutor, len(executors))
+	for name, executor := range executors {
+		hooks[name] = executor
+	}
+
+	return &Executor{
+		dbs:          copied,
+		sqlExecutors: hooks,
+	}
 }
 
-func (e *Executor) Run(ctx context.Context, wf *Workflow, incoming map[string]string) (*Execution, error) {
+func (e *Executor) Run(ctx context.Context, wf *Workflow, incoming any) (*Execution, error) {
 	if wf == nil {
 		return nil, fmt.Errorf("workflow is required")
 	}
@@ -79,9 +151,17 @@ func (e *Executor) Run(ctx context.Context, wf *Workflow, incoming map[string]st
 		return nil, err
 	}
 
+	incomingObject, hasIncomingObject, err := normalizeIncomingObject(incoming)
+	if err != nil {
+		return nil, err
+	}
+
 	vars := make(map[string]any, len(wf.Inputs)+len(wf.Steps))
 	for _, input := range wf.Inputs {
-		rawValue, exists := incoming[input.Name]
+		rawValue, exists, err := resolveInputRawValue(wf, input, incoming, incomingObject, hasIncomingObject)
+		if err != nil {
+			return nil, err
+		}
 		if !exists {
 			rawValue = input.InitialValue()
 		}
@@ -105,30 +185,188 @@ func (e *Executor) Run(ctx context.Context, wf *Workflow, incoming map[string]st
 		}
 	}
 
+	execution.scope = cloneScope(vars)
 	execution.Resolved = sortedParams(vars)
 	return execution, nil
 }
 
-func parseInputValue(input Input, raw string) (any, error) {
-	if input.Required && strings.TrimSpace(raw) == "" {
-		return nil, fmt.Errorf("input %q is required", input.Name)
-	}
-
+func parseInputValue(input Input, raw any) (any, error) {
 	switch strings.ToLower(strings.TrimSpace(input.Type)) {
 	case "json":
-		if strings.TrimSpace(raw) == "" {
+		if isEmptyInputValue(raw) {
+			if input.Required {
+				return nil, fmt.Errorf("input %q is required", input.Name)
+			}
 			return nil, nil
 		}
 
-		var value any
-		if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		value, err := normalizeJSONInputValue(raw)
+		if err != nil {
 			return nil, fmt.Errorf("input %q parse json: %w", input.Name, err)
 		}
 
 		return value, nil
 	default:
-		return raw, nil
+		text := stringifyInputValue(raw)
+		if input.Required && strings.TrimSpace(text) == "" {
+			return nil, fmt.Errorf("input %q is required", input.Name)
+		}
+		return text, nil
 	}
+}
+
+func resolveInputRawValue(wf *Workflow, input Input, incoming any, incomingObject map[string]any, hasIncomingObject bool) (any, bool, error) {
+	if hasIncomingObject {
+		if value, ok := lookupIncomingObjectValue(incomingObject, input.Name); ok {
+			return value, true, nil
+		}
+	}
+
+	if isSingleJSONInputWorkflow(wf, input) && canUseWholeJSONIncoming(incoming) {
+		value, err := normalizeJSONInputValue(incoming)
+		if err != nil {
+			return nil, false, err
+		}
+		return value, true, nil
+	}
+
+	return nil, false, nil
+}
+
+func normalizeIncomingObject(incoming any) (map[string]any, bool, error) {
+	if !isIncomingObject(incoming) {
+		return nil, false, nil
+	}
+
+	object, err := toObjectMap(incoming)
+	if err != nil {
+		return nil, false, fmt.Errorf("normalize incoming params: %w", err)
+	}
+
+	return object, true, nil
+}
+
+func isIncomingObject(value any) bool {
+	current := reflect.ValueOf(value)
+	for current.IsValid() && (current.Kind() == reflect.Pointer || current.Kind() == reflect.Interface) {
+		if current.IsNil() {
+			return false
+		}
+		current = current.Elem()
+	}
+
+	if !current.IsValid() {
+		return false
+	}
+
+	switch current.Kind() {
+	case reflect.Map:
+		return current.Type().Key().Kind() == reflect.String
+	case reflect.Struct:
+		return true
+	default:
+		return false
+	}
+}
+
+func isSingleJSONInputWorkflow(wf *Workflow, input Input) bool {
+	return wf != nil && len(wf.Inputs) == 1 && wf.Inputs[0].Name == input.Name && strings.EqualFold(input.Type, "json")
+}
+
+func canUseWholeJSONIncoming(incoming any) bool {
+	current := reflect.ValueOf(incoming)
+	for current.IsValid() && (current.Kind() == reflect.Pointer || current.Kind() == reflect.Interface) {
+		if current.IsNil() {
+			return false
+		}
+		current = current.Elem()
+	}
+
+	if !current.IsValid() {
+		return false
+	}
+
+	switch current.Kind() {
+	case reflect.Struct:
+		return true
+	case reflect.Map:
+		return current.Type().Key().Kind() == reflect.String && current.Type().Elem().Kind() != reflect.String
+	default:
+		return false
+	}
+}
+
+func normalizeJSONInputValue(raw any) (any, error) {
+	switch typed := raw.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return nil, nil
+		}
+
+		var value any
+		if err := json.Unmarshal([]byte(trimmed), &value); err != nil {
+			return nil, err
+		}
+		return value, nil
+	default:
+		encoded, err := json.Marshal(raw)
+		if err != nil {
+			return nil, err
+		}
+
+		var value any
+		if err := json.Unmarshal(encoded, &value); err != nil {
+			return nil, err
+		}
+		return value, nil
+	}
+}
+
+func stringifyInputValue(raw any) string {
+	if raw == nil {
+		return ""
+	}
+	if text, ok := raw.(string); ok {
+		return text
+	}
+	return fmt.Sprint(raw)
+}
+
+func isEmptyInputValue(raw any) bool {
+	if raw == nil {
+		return true
+	}
+	text, ok := raw.(string)
+	return ok && strings.TrimSpace(text) == ""
+}
+
+func lookupIncomingObjectValue(object map[string]any, name string) (any, bool) {
+	if value, ok := object[name]; ok {
+		return value, true
+	}
+
+	normalizedName := normalizeIncomingParamName(name)
+	for key, value := range object {
+		if strings.EqualFold(key, name) || normalizeIncomingParamName(key) == normalizedName {
+			return value, true
+		}
+	}
+
+	return nil, false
+}
+
+func normalizeIncomingParamName(value string) string {
+	var builder strings.Builder
+	builder.Grow(len(value))
+	for _, char := range value {
+		if unicode.IsLetter(char) || unicode.IsDigit(char) {
+			builder.WriteRune(unicode.ToLower(char))
+		}
+	}
+	return builder.String()
 }
 
 func (e *Executor) executeStep(ctx context.Context, wf *Workflow, step Step, vars map[string]any, execution *Execution) error {
@@ -139,18 +377,21 @@ func (e *Executor) executeStep(ctx context.Context, wf *Workflow, step Step, var
 			return err
 		}
 		vars[step.Name] = value
+		execution.recordResult(value)
 	case "pick":
 		value, err := e.evaluatePick(step, vars, nil)
 		if err != nil {
 			return err
 		}
 		vars[step.Name] = value
+		execution.recordResult(value)
 	case "transform":
 		value, err := e.evaluateTransform(wf, step, vars, nil)
 		if err != nil {
 			return err
 		}
 		vars[step.Name] = value
+		execution.recordResult(value)
 		if step.Export {
 			if err := exportObjectVars(step, value, vars); err != nil {
 				return err
@@ -162,6 +403,7 @@ func (e *Executor) executeStep(ctx context.Context, wf *Workflow, step Step, var
 			return err
 		}
 		vars[step.Name] = value
+		execution.recordResult(value)
 	case "sql":
 		return e.executeSQL(ctx, wf, step, vars, execution)
 	default:
@@ -182,6 +424,14 @@ func exportObjectVars(step Step, value any, vars map[string]any) error {
 	}
 
 	return nil
+}
+
+func (e *Execution) recordResult(value any) {
+	if e == nil {
+		return
+	}
+	e.lastResult = value
+	e.lastResultSet = true
 }
 
 func (e *Executor) evaluateVar(wf *Workflow, step Step, vars map[string]any) (any, error) {
@@ -816,11 +1066,6 @@ func (e *Executor) executeSQL(ctx context.Context, wf *Workflow, step Step, vars
 		datasource = "default"
 	}
 
-	db, ok := e.dbs[datasource]
-	if !ok {
-		return fmt.Errorf("datasource %q is not configured", datasource)
-	}
-
 	var (
 		sourceLanguage string
 		sourceText     string
@@ -848,6 +1093,36 @@ func (e *Executor) executeSQL(ctx context.Context, wf *Workflow, step Step, vars
 	execution.SQL = sqlText
 	execution.SQLMode = step.NormalizedMode()
 
+	if step.NormalizedMode() == "query" {
+		if executor, ok := e.sqlExecutors[datasource]; ok {
+			rows, err := executor.Query(ctx, SQLRequest{
+				Workflow:   wf,
+				Step:       step,
+				Datasource: datasource,
+				SQL:        sqlText,
+				Args:       append([]any(nil), args...),
+			})
+			if err != nil {
+				return fmt.Errorf("query sql: %w", err)
+			}
+
+			queryResult := buildQueryResultFromStringRows(rows)
+			execution.Query = queryResult
+			execution.recordResult(queryResult.Rows)
+
+			if strings.TrimSpace(step.Name) != "" {
+				vars[step.Name] = queryResult.Rows
+			}
+
+			return nil
+		}
+	}
+
+	db, ok := e.dbs[datasource]
+	if !ok {
+		return fmt.Errorf("datasource %q is not configured", datasource)
+	}
+
 	if step.NormalizedMode() == "exec" {
 		result, err := db.ExecContext(ctx, sqlText, args...)
 		if err != nil {
@@ -868,6 +1143,10 @@ func (e *Executor) executeSQL(ctx context.Context, wf *Workflow, step Step, vars
 			RowsAffected: rowsAffected,
 			LastInsertID: lastInsertID,
 		}
+		execution.recordResult(map[string]any{
+			"rowsAffected": rowsAffected,
+			"lastInsertID": lastInsertID,
+		})
 
 		if strings.TrimSpace(step.Name) != "" {
 			vars[step.Name] = map[string]any{
@@ -891,12 +1170,63 @@ func (e *Executor) executeSQL(ctx context.Context, wf *Workflow, step Step, vars
 	}
 
 	execution.Query = queryResult
+	execution.recordResult(queryResult.Rows)
 
 	if strings.TrimSpace(step.Name) != "" {
 		vars[step.Name] = queryResult.Rows
 	}
 
 	return nil
+}
+
+func buildQueryResultFromStringRows(rows []map[string]string) *QueryResult {
+	if len(rows) == 0 {
+		return &QueryResult{
+			Columns: []string{},
+			Rows:    []map[string]any{},
+		}
+	}
+
+	columnSet := make(map[string]struct{})
+	resultRows := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		resultRow := make(map[string]any, len(row))
+		for key, value := range row {
+			columnSet[key] = struct{}{}
+			resultRow[key] = normalizeStringQueryValue(value)
+		}
+		resultRows = append(resultRows, resultRow)
+	}
+
+	columns := make([]string, 0, len(columnSet))
+	for column := range columnSet {
+		columns = append(columns, column)
+	}
+	sort.Strings(columns)
+
+	return &QueryResult{
+		Columns: columns,
+		Rows:    resultRows,
+	}
+}
+
+func normalizeStringQueryValue(value string) any {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return value
+	}
+
+	if number, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+		return number
+	}
+	if number, err := strconv.ParseFloat(trimmed, 64); err == nil {
+		return number
+	}
+	if boolean, err := strconv.ParseBool(strings.ToLower(trimmed)); err == nil {
+		return boolean
+	}
+
+	return value
 }
 
 func renderGoSQL(sourceText string, vars map[string]any) (string, []any, error) {
@@ -1557,10 +1887,22 @@ func lookupField(value any, key string) (any, bool) {
 		}
 
 		found := current.MapIndex(reflect.ValueOf(key))
-		if !found.IsValid() {
-			return nil, false
+		if found.IsValid() {
+			return found.Interface(), true
 		}
-		return found.Interface(), true
+
+		normalizedKey := normalizeIncomingParamName(key)
+		for _, mapKey := range current.MapKeys() {
+			mapKeyText := mapKey.String()
+			if strings.EqualFold(mapKeyText, key) || normalizeIncomingParamName(mapKeyText) == normalizedKey {
+				found = current.MapIndex(mapKey)
+				if found.IsValid() {
+					return found.Interface(), true
+				}
+			}
+		}
+
+		return nil, false
 	case reflect.Struct:
 		for index := 0; index < current.NumField(); index++ {
 			field := current.Type().Field(index)
@@ -1977,6 +2319,14 @@ func sortedParams(vars map[string]any) []ResolvedParam {
 	}
 
 	return params
+}
+
+func cloneScope(vars map[string]any) map[string]any {
+	cloned := make(map[string]any, len(vars))
+	for key, value := range vars {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func scanRows(rows *sql.Rows) (*QueryResult, error) {

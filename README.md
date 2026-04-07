@@ -1,6 +1,6 @@
 # go-future
 
-一个用 Go 编写的工作流型 Web 项目原型。
+一个用 Go 编写的工作流功能库。
 
 这个项目的重点不是继续堆业务 API，而是把“工具”和“工作流”变成一等能力。当前版本已经支持用 **XML 定义工作流**，并把几个内置工具标签串起来执行：
 
@@ -14,7 +14,6 @@
 
 ## 当前能力
 
-- 基于 Go `net/http` 的 Web 页面
 - XML 工作流定义，层级尽量少
 - 支持复杂 JSON 输入
 - 支持路径选择器
@@ -42,7 +41,7 @@
 - `sql` 和 `transform mode="js"` 都支持 `src`
   - 可以继续内嵌
   - 也可以引用外部 `.js` / `.md`
-- 默认使用 SQLite，开箱可跑
+- 可作为纯库嵌入业务项目，也可以把 SQL 查询接到外部框架
 
 ## XML 设计
 
@@ -418,6 +417,7 @@ return {
 import (
   "context"
   "database/sql"
+  "embed"
 
   "github.com/llyb120/go-future"
 )
@@ -436,8 +436,10 @@ if !ok {
   panic("workflow not found")
 }
 
-result, err := executor.Run(context.Background(), selected, map[string]string{
-  "customerEmail": "alice.future@demo.ai",
+result, err := executor.Run(context.Background(), selected, struct {
+  CustomerEmail string
+}{
+  CustomerEmail: "alice.future@demo.ai",
 })
 if err != nil {
   panic(err)
@@ -446,28 +448,53 @@ if err != nil {
 _ = result
 ```
 
+`Run(...)` 的第三个参数是 `any`：可以继续传 `map[string]string`，也可以直接传 struct 或 `map[string]any`。如果 workflow 只有一个 `type="json"` 输入，还可以把整个 struct/map 直接当 payload 传进去。
+
+执行完成后，可以用 `result.GetScope("tenantCode")` 读取 scope 变量；`result.GetResult()` 会优先返回名为 `@result` 的定义，否则返回最后一步的结果。
+
+如果 workflow 来自 `embed.FS`，可以直接用：
+
+```go
+//go:embed workflows/**
+var workflowsFS embed.FS
+
+catalog, err := future.LoadDirFS(workflowsFS, "workflows")
+if err != nil {
+  panic(err)
+}
+```
+
+如果查询不想走内置 `*sql.DB`，也可以把 SQL 查询接到外部框架：
+
+```go
+executor := future.NewExecutorWithSQLExecutors(nil, map[string]future.SQLExecutor{
+  "default": future.SQLExecutorFunc(func(ctx context.Context, request future.SQLRequest) ([]map[string]string, error) {
+    return []map[string]string{
+      {"tenant": "acme"},
+    }, nil
+  }),
+})
+```
+
+传给外部 SQL hook 的 `request.SQL / request.Args` 是 workflow 引擎已经整理好的执行请求：
+
+- 普通 SQL 保留命名参数 SQL，`request.Args` 中是 `sql.NamedArg`
+- `gosql` 会传渲染后的 SQL 和对应参数列表
+
 如果 workflow XML 不是放在目录里，也可以直接用：
 
 - `future.LoadFile(path)`
+- `future.LoadDirFS(fsys, dir)`
+- `future.LoadFileFS(fsys, path)`
 - `future.Parse(content, sourcePath)`
 - `future.ParseString(content, sourcePath)`
 - `future.NewCatalog(...)`
 
 兼容旧调用方时，也仍然可以继续使用子包：`github.com/llyb120/go-future/workflow`
 
-## 本地运行
+## 示例工作流
 
-```powershell
-go run .\cmd\go-future
-```
-
-启动后打开：
-
-```text
-http://localhost:8080
-```
-
-页面里现在有七个示例工作流：
+仓库里当前带了几个示例工作流：
 
 - `user-search`：简单变量整理 + 普通 SQL
 - `user-search-advanced`：复杂 JSON 输入 + `transform export="true"` 参数整理 + `gosql`
@@ -487,27 +514,16 @@ go test ./...
 
 ```text
 .
-├─ cmd
-│  └─ go-future
-│     └─ main.go
 ├─ internal
-│  ├─ data
 │  ├─ jsruntime
-│  ├─ web
 │  └─ workflow
 ├─ workflows
 │  ├─ sql-users-search.xml
 │  ├─ sql-users-search-advanced.xml
 │  ├─ customer-orders-external.xml
 │  ├─ customer-orders-structured.xml
-│  ├─ global-dynamics
-│  │  ├─ report.xml
-│  │  ├─ date.xml
-│  │  └─ res
 │  ├─ scripts
 │  └─ snippets
-├─ data
-│  └─ demo.db
 ├─ api.go
 └─ README.md
 ```

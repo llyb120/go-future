@@ -866,25 +866,19 @@ customerEmail
 
 ---
 
-## 14. 运行与验证
+## 14. 加载与验证
 
-本地运行：
+典型加载方式：
 
-```powershell
-go run .\cmd\go-future
+```go
+catalog, err := future.LoadDir("workflows")
+executor := future.NewExecutor(nil)
 ```
 
 测试：
 
 ```powershell
 go test ./...
-```
-
-如果默认端口被占用：
-
-```powershell
-$env:ADDR = ":18080"
-go run .\cmd\go-future
 ```
 
 ---

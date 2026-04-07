@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -53,8 +54,62 @@ func LoadDir(dir string) (*Catalog, error) {
 	return NewCatalog(workflows...)
 }
 
+func LoadDirFS(fsys fs.FS, dir string) (*Catalog, error) {
+	dir = normalizeFSPath(dir)
+	matches, err := findWorkflowFilesFS(fsys, dir)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("no workflow xml files found in %s", dir)
+	}
+
+	resourceCache := make(map[string]*resourceRegistry)
+	workflows := make([]*Workflow, 0, len(matches))
+	for _, file := range matches {
+		baseDir := pathpkg.Dir(file)
+		resources, ok := resourceCache[baseDir]
+		if !ok {
+			resources, err = loadResourceRegistryFS(fsys, baseDir)
+			if err != nil {
+				return nil, err
+			}
+			resourceCache[baseDir] = resources
+		}
+
+		content, err := fs.ReadFile(fsys, file)
+		if err != nil {
+			return nil, fmt.Errorf("read workflow file %s: %w", file, err)
+		}
+
+		wf, err := parseWithResources(content, file, resources)
+		if err != nil {
+			return nil, fmt.Errorf("load workflow file %s: %w", file, err)
+		}
+		workflows = append(workflows, wf)
+	}
+
+	return NewCatalog(workflows...)
+}
+
 func LoadFile(path string) (*Workflow, error) {
 	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read workflow file %s: %w", path, err)
+	}
+
+	wf, err := parseWithResources(content, path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("load workflow file %s: %w", path, err)
+	}
+
+	return wf, nil
+}
+
+func LoadFileFS(fsys fs.FS, path string) (*Workflow, error) {
+	path = normalizeFSPath(path)
+	content, err := fs.ReadFile(fsys, path)
 	if err != nil {
 		return nil, fmt.Errorf("read workflow file %s: %w", path, err)
 	}
@@ -111,6 +166,36 @@ func findWorkflowFiles(dir string) ([]string, error) {
 
 	sort.Strings(files)
 	return files, nil
+}
+
+func findWorkflowFilesFS(fsys fs.FS, dir string) ([]string, error) {
+	files := make([]string, 0)
+	if err := fs.WalkDir(fsys, dir, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if strings.EqualFold(pathpkg.Ext(path), ".xml") {
+			files = append(files, path)
+		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("scan workflow files: %w", err)
+	}
+
+	sort.Strings(files)
+	return files, nil
+}
+
+func normalizeFSPath(path string) string {
+	path = filepath.ToSlash(strings.TrimSpace(path))
+	path = strings.TrimPrefix(path, "./")
+	if path == "" {
+		return "."
+	}
+	return pathpkg.Clean(path)
 }
 
 func NewCatalog(workflows ...*Workflow) (*Catalog, error) {

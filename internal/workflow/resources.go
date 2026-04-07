@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"strings"
 )
@@ -21,10 +22,7 @@ type registeredSource struct {
 }
 
 func loadResourceRegistry(dir string) (*resourceRegistry, error) {
-	registry := &resourceRegistry{
-		sqlByName: make(map[string]registeredSource),
-		jsByName:  make(map[string]string),
-	}
+	registry := newResourceRegistry()
 
 	jsSources := make([]string, 0)
 	if err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, walkErr error) error {
@@ -73,6 +71,63 @@ func loadResourceRegistry(dir string) (*resourceRegistry, error) {
 	return registry, nil
 }
 
+func loadResourceRegistryFS(fsys fs.FS, dir string) (*resourceRegistry, error) {
+	registry := newResourceRegistry()
+
+	jsSources := make([]string, 0)
+	if err := fs.WalkDir(fsys, dir, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if path != dir {
+				hasWorkflowXML, err := dirContainsWorkflowXMLFS(fsys, path)
+				if err != nil {
+					return err
+				}
+				if hasWorkflowXML {
+					return fs.SkipDir
+				}
+			}
+			return nil
+		}
+
+		content, err := fs.ReadFile(fsys, path)
+		if err != nil {
+			return fmt.Errorf("read resource %s: %w", path, err)
+		}
+
+		switch {
+		case isPreloadedSQLMarkdownPath(path):
+			if err := registry.registerMarkdownSQL(path, string(content)); err != nil {
+				return err
+			}
+		case isPreloadedJSSourcePath(path):
+			scriptSource, err := registry.registerJSSource(path, string(content))
+			if err != nil {
+				return err
+			}
+			if strings.TrimSpace(scriptSource) != "" {
+				jsSources = append(jsSources, scriptSource)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("scan workflow resources: %w", err)
+	}
+
+	registry.jsBundle = strings.Join(jsSources, "\n\n")
+	return registry, nil
+}
+
+func newResourceRegistry() *resourceRegistry {
+	return &resourceRegistry{
+		sqlByName: make(map[string]registeredSource),
+		jsByName:  make(map[string]string),
+	}
+}
+
 func isPreloadedSQLMarkdownPath(path string) bool {
 	lower := strings.ToLower(filepath.ToSlash(path))
 	return strings.HasSuffix(lower, ".sql.md") || strings.HasSuffix(lower, ".sql.markdown")
@@ -98,6 +153,24 @@ func dirContainsWorkflowXML(dir string) (bool, error) {
 			continue
 		}
 		if strings.EqualFold(filepath.Ext(entry.Name()), ".xml") {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func dirContainsWorkflowXMLFS(fsys fs.FS, dir string) (bool, error) {
+	entries, err := fs.ReadDir(fsys, dir)
+	if err != nil {
+		return false, fmt.Errorf("read workflow directory %s: %w", dir, err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if strings.EqualFold(pathpkg.Ext(entry.Name()), ".xml") {
 			return true, nil
 		}
 	}
