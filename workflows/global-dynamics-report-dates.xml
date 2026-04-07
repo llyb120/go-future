@@ -1,0 +1,11 @@
+<workflow name="global-dynamics-report-dates" title="异动日报日期列表" description="查询异动日报已有日期，支持开始/结束日期过滤；需要对应 intelligence 数据源。">
+  <input name="StartDate" label="开始日期" default="" placeholder="YYYY-MM-DD，可留空" />
+  <input name="EndDate" label="结束日期" default="" placeholder="YYYY-MM-DD，可留空" />
+
+  <var name="StartDate" from="StartDate" default="" op="trim" />
+  <var name="EndDate" from="EndDate" default="" op="trim" />
+
+  <sql name="reportDates" mode="query" engine="gosql" datasource="default" src="global-dynamics.get-all-report-date-real-time" />
+
+  <var name="reportDateList" from="reportDates > report_date" optional="true" default="[]" op="json" />
+</workflow>

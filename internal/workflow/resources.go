@@ -32,6 +32,15 @@ func loadResourceRegistry(dir string) (*resourceRegistry, error) {
 			return walkErr
 		}
 		if entry.IsDir() {
+			if path != dir {
+				hasWorkflowXML, err := dirContainsWorkflowXML(path)
+				if err != nil {
+					return err
+				}
+				if hasWorkflowXML {
+					return filepath.SkipDir
+				}
+			}
 			return nil
 		}
 
@@ -40,12 +49,12 @@ func loadResourceRegistry(dir string) (*resourceRegistry, error) {
 			return fmt.Errorf("read resource %s: %w", path, err)
 		}
 
-		switch strings.ToLower(filepath.Ext(path)) {
-		case ".md", ".markdown":
+		switch {
+		case isPreloadedSQLMarkdownPath(path):
 			if err := registry.registerMarkdownSQL(path, string(content)); err != nil {
 				return err
 			}
-		case ".js", ".mjs", ".cjs":
+		case isPreloadedJSSourcePath(path):
 			scriptSource, err := registry.registerJSSource(path, string(content))
 			if err != nil {
 				return err
@@ -62,6 +71,38 @@ func loadResourceRegistry(dir string) (*resourceRegistry, error) {
 
 	registry.jsBundle = strings.Join(jsSources, "\n\n")
 	return registry, nil
+}
+
+func isPreloadedSQLMarkdownPath(path string) bool {
+	lower := strings.ToLower(filepath.ToSlash(path))
+	return strings.HasSuffix(lower, ".sql.md") || strings.HasSuffix(lower, ".sql.markdown")
+}
+
+func isPreloadedJSSourcePath(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".js", ".mjs", ".cjs":
+		return true
+	default:
+		return false
+	}
+}
+
+func dirContainsWorkflowXML(dir string) (bool, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false, fmt.Errorf("read workflow directory %s: %w", dir, err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if strings.EqualFold(filepath.Ext(entry.Name()), ".xml") {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 func (r *resourceRegistry) registerMarkdownSQL(path string, markdown string) error {
@@ -150,7 +191,7 @@ func (r *resourceRegistry) registerJSSource(path string, source string) (string,
 		if err != nil {
 			return "", fmt.Errorf("prepare javascript resource %s: %w", path, err)
 		}
-		return scriptSource, nil
+		return "(function(){\n" + scriptSource + "\n})();", nil
 	}
 
 	return source, nil

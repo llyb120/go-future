@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -663,7 +664,7 @@ order by id
 `
 
 	workflowPath := filepath.Join(dir, "external-sql.xml")
-	markdownPath := filepath.Join(dir, "snippets", "queries.md")
+	markdownPath := filepath.Join(dir, "res", "queries.sql.md")
 
 	if err := os.MkdirAll(filepath.Dir(markdownPath), 0o755); err != nil {
 		t.Fatalf("mkdir snippets: %v", err)
@@ -700,6 +701,62 @@ order by id
 
 	if got := result.Query.Rows[0]["name"]; got != "Alice Zhang" {
 		t.Fatalf("expected Alice Zhang, got %#v", got)
+	}
+}
+
+func TestExecutorRunSQLNamedSourceIgnoresPlainMarkdown(t *testing.T) {
+	db := newTestDB(t)
+	dir := t.TempDir()
+
+	workflowXML := `<workflow name="external-sql" title="External SQL">
+  <input name="tenant" required="true" />
+  <sql name="users" mode="query" engine="gosql" src="snippets.active-users" />
+</workflow>`
+
+	markdown := `# snippets
+
+## active-users
+
+` + "```sql" + `
+select id, tenant, name, email, status
+from users
+where tenant = @tenant
+order by id
+` + "```" + `
+`
+
+	workflowPath := filepath.Join(dir, "report.xml")
+	markdownPath := filepath.Join(dir, "res", "queries.md")
+
+	if err := os.MkdirAll(filepath.Dir(markdownPath), 0o755); err != nil {
+		t.Fatalf("mkdir res: %v", err)
+	}
+	if err := os.WriteFile(workflowPath, []byte(workflowXML), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+	if err := os.WriteFile(markdownPath, []byte(markdown), 0o644); err != nil {
+		t.Fatalf("write markdown: %v", err)
+	}
+
+	catalog, err := LoadDir(dir)
+	if err != nil {
+		t.Fatalf("LoadDir() error = %v", err)
+	}
+
+	wf, ok := catalog.Get("external-sql")
+	if !ok {
+		t.Fatalf("expected workflow external-sql")
+	}
+
+	executor := NewExecutor(map[string]*sql.DB{"default": db})
+	_, err = executor.Run(context.Background(), wf, map[string]string{
+		"tenant": "acme",
+	})
+	if err == nil {
+		t.Fatalf("expected Run() to reject plain markdown preload")
+	}
+	if !strings.Contains(err.Error(), `sql source "snippets.active-users" not found in preloaded markdown resources`) {
+		t.Fatalf("expected named sql preload error, got %v", err)
 	}
 }
 
@@ -849,6 +906,194 @@ func TestLoadDirRejectsNonMarkdownExternalSQL(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "must be a markdown file") {
 		t.Fatalf("expected markdown source error, got %v", err)
+	}
+}
+
+func TestLoadDirSupportsNestedWorkflowFolders(t *testing.T) {
+	db := newTestDB(t)
+	dir := t.TempDir()
+
+	alphaWorkflow := `<workflow name="alpha-report" title="Alpha Report">
+  <sql name="rows" mode="query" src="alpha.get" />
+  <transform name="summary" mode="js" from="rows > :first" entry="buildSummary" />
+</workflow>`
+	alphaSQL := `# alpha
+
+## get
+` + "```sql" + `
+SELECT 1 AS value;
+` + "```"
+	alphaJS := `export function buildSummary({ input }) {
+  return {
+    source: "alpha",
+    value: input?.value || 0,
+  };
+}`
+
+	betaWorkflow := `<workflow name="beta-report" title="Beta Report">
+  <sql name="rows" mode="query" src="beta.get" />
+  <transform name="summary" mode="js" from="rows > :first" entry="buildSummary" />
+</workflow>`
+	betaSQL := `# beta
+
+## get
+` + "```sql" + `
+SELECT 2 AS value;
+` + "```"
+	betaJS := `export function buildSummary({ input }) {
+  return {
+    source: "beta",
+    value: input?.value || 0,
+  };
+}`
+
+	alphaDir := filepath.Join(dir, "alpha")
+	betaDir := filepath.Join(dir, "team", "beta")
+	for _, item := range []struct {
+		path    string
+		content string
+	}{
+		{filepath.Join(alphaDir, "report.xml"), alphaWorkflow},
+		{filepath.Join(alphaDir, "res", "queries.sql.md"), alphaSQL},
+		{filepath.Join(alphaDir, "res", "summary.js"), alphaJS},
+		{filepath.Join(betaDir, "date.xml"), betaWorkflow},
+		{filepath.Join(betaDir, "res", "queries.sql.md"), betaSQL},
+		{filepath.Join(betaDir, "res", "summary.js"), betaJS},
+	} {
+		if err := os.MkdirAll(filepath.Dir(item.path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", filepath.Dir(item.path), err)
+		}
+		if err := os.WriteFile(item.path, []byte(item.content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", item.path, err)
+		}
+	}
+
+	catalog, err := LoadDir(dir)
+	if err != nil {
+		t.Fatalf("LoadDir() error = %v", err)
+	}
+
+	executor := NewExecutor(map[string]*sql.DB{"default": db})
+	for _, expected := range []struct {
+		name   string
+		source string
+		value  int64
+	}{
+		{name: "alpha-report", source: "alpha", value: 1},
+		{name: "beta-report", source: "beta", value: 2},
+	} {
+		wf, ok := catalog.Get(expected.name)
+		if !ok {
+			t.Fatalf("expected workflow %s", expected.name)
+		}
+
+		result, err := executor.Run(context.Background(), wf, map[string]string{})
+		if err != nil {
+			t.Fatalf("Run(%s) error = %v", expected.name, err)
+		}
+
+		summaryValue, ok := findResolvedParam(result, "summary")
+		if !ok {
+			t.Fatalf("expected summary for %s", expected.name)
+		}
+
+		summary, ok := summaryValue.(map[string]any)
+		if !ok {
+			t.Fatalf("expected summary map for %s, got %T", expected.name, summaryValue)
+		}
+
+		if summary["source"] != expected.source {
+			t.Fatalf("expected %s source %q, got %#v", expected.name, expected.source, summary["source"])
+		}
+		if fmt.Sprint(summary["value"]) != fmt.Sprint(expected.value) {
+			t.Fatalf("expected %s value %d, got %#v", expected.name, expected.value, summary["value"])
+		}
+	}
+}
+
+func TestLoadDirSharesResFolderAcrossWorkflowXMLInSameDirectory(t *testing.T) {
+	db := newTestDB(t)
+	dir := t.TempDir()
+
+	reportWorkflow := `<workflow name="folder-report" title="Folder Report">
+  <sql name="rows" mode="query" src="folder.get-report" />
+  <transform name="summary" mode="js" from="rows > :first" entry="buildSummary" />
+</workflow>`
+	dateWorkflow := `<workflow name="folder-dates" title="Folder Dates">
+  <sql name="rows" mode="query" src="folder.get-dates" />
+  <transform name="summary" mode="js" from="rows > :first" entry="buildSummary" />
+</workflow>`
+	sqlText := `# folder
+
+## get-report
+` + "```sql" + `
+SELECT 7 AS value;
+` + "```" + `
+
+## get-dates
+` + "```sql" + `
+SELECT 9 AS value;
+` + "```"
+	jsText := `export function buildSummary({ input }) {
+  return {
+    value: input?.value || 0,
+  };
+}`
+
+	workflowDir := filepath.Join(dir, "global_daily_report")
+	for _, item := range []struct {
+		path    string
+		content string
+	}{
+		{filepath.Join(workflowDir, "report.xml"), reportWorkflow},
+		{filepath.Join(workflowDir, "date.xml"), dateWorkflow},
+		{filepath.Join(workflowDir, "res", "queries.sql.md"), sqlText},
+		{filepath.Join(workflowDir, "res", "helpers.js"), jsText},
+	} {
+		if err := os.MkdirAll(filepath.Dir(item.path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", filepath.Dir(item.path), err)
+		}
+		if err := os.WriteFile(item.path, []byte(item.content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", item.path, err)
+		}
+	}
+
+	catalog, err := LoadDir(dir)
+	if err != nil {
+		t.Fatalf("LoadDir() error = %v", err)
+	}
+
+	executor := NewExecutor(map[string]*sql.DB{"default": db})
+	for _, expected := range []struct {
+		name  string
+		value int64
+	}{
+		{name: "folder-report", value: 7},
+		{name: "folder-dates", value: 9},
+	} {
+		wf, ok := catalog.Get(expected.name)
+		if !ok {
+			t.Fatalf("expected workflow %s", expected.name)
+		}
+
+		result, err := executor.Run(context.Background(), wf, map[string]string{})
+		if err != nil {
+			t.Fatalf("Run(%s) error = %v", expected.name, err)
+		}
+
+		summaryValue, ok := findResolvedParam(result, "summary")
+		if !ok {
+			t.Fatalf("expected summary for %s", expected.name)
+		}
+
+		summary, ok := summaryValue.(map[string]any)
+		if !ok {
+			t.Fatalf("expected summary map for %s, got %T", expected.name, summaryValue)
+		}
+
+		if fmt.Sprint(summary["value"]) != fmt.Sprint(expected.value) {
+			t.Fatalf("expected %s value %d, got %#v", expected.name, expected.value, summary["value"])
+		}
 	}
 }
 

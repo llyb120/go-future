@@ -573,7 +573,36 @@ export async function customerOrderStats({ input, keys, asArray }) {
 }
 ```
 
-### 8.9 JS 中可用的变量和辅助函数
+### 8.9 推荐目录组织
+
+`LoadDir(...)` 会递归发现所有 workflow XML，并按**每个 XML 所在目录**绑定对应资源树。如果子目录里也有 XML，则会被视为另一个 workflow 目录边界，不会混用资源。
+
+推荐结构：
+
+```text
+workflows
+├─ global-dynamics
+│  ├─ WORKFLOW.xml
+│  ├─ scripts
+│  │  └─ global-dynamics.js
+│  └─ sql
+│     └─ global-dynamics.sql.md
+└─ reports
+   ├─ topcharts.xml
+   ├─ revenue.xml
+   ├─ scripts
+   │  └─ shared.js
+   └─ sql
+      └─ shared.sql.md
+```
+
+说明：
+
+- 一个目录可以只放一个 `WORKFLOW.xml`
+- 也可以同目录放多个 workflow XML，共享这一层的 `scripts / sql`
+- 老的平铺结构继续兼容
+
+### 8.10 JS 中可用的变量和辅助函数
 
 当前 JS transform 默认注入：
 
@@ -596,7 +625,7 @@ export async function customerOrderStats({ input, keys, asArray }) {
 - `asArray(value)`
   - 方便把单值或空值规整成数组
 
-### 8.10 JS transform 的约束
+### 8.11 JS transform 的约束
 
 - 当前实现参考 `go-v8-unified-demo`
 - Windows 下通过 **Node.js 子进程** 执行
@@ -876,6 +905,12 @@ go run .\cmd\go-future
 
 - `customer-orders-external.xml`
   - 与上面同一个主题，但 SQL 走 Markdown namespace 引用，JS 走预加载函数引用
+
+- `global-dynamics-daily-report.xml`
+  - 复刻异动日报主查询，返回 `{ data, exist }`
+
+- `global-dynamics-report-dates.xml`
+  - 查询异动日报已有日期列表
 
 ---
 

@@ -3,9 +3,11 @@ package workflow
 import (
 	"encoding/xml"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 type Catalog struct {
@@ -14,23 +16,28 @@ type Catalog struct {
 }
 
 func LoadDir(dir string) (*Catalog, error) {
-	pattern := filepath.Join(dir, "*.xml")
-	matches, err := filepath.Glob(pattern)
+	matches, err := findWorkflowFiles(dir)
 	if err != nil {
-		return nil, fmt.Errorf("glob workflow files: %w", err)
+		return nil, err
 	}
 
 	if len(matches) == 0 {
 		return nil, fmt.Errorf("no workflow xml files found in %s", dir)
 	}
 
-	resources, err := loadResourceRegistry(dir)
-	if err != nil {
-		return nil, err
-	}
-
+	resourceCache := make(map[string]*resourceRegistry)
 	workflows := make([]*Workflow, 0, len(matches))
 	for _, file := range matches {
+		baseDir := filepath.Dir(file)
+		resources, ok := resourceCache[baseDir]
+		if !ok {
+			resources, err = loadResourceRegistry(baseDir)
+			if err != nil {
+				return nil, err
+			}
+			resourceCache[baseDir] = resources
+		}
+
 		content, err := os.ReadFile(file)
 		if err != nil {
 			return nil, fmt.Errorf("read workflow file %s: %w", file, err)
@@ -83,6 +90,27 @@ func parseWithResources(content []byte, sourcePath string, resources *resourceRe
 
 func ParseString(content string, sourcePath string) (*Workflow, error) {
 	return Parse([]byte(content), sourcePath)
+}
+
+func findWorkflowFiles(dir string) ([]string, error) {
+	files := make([]string, 0)
+	if err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if strings.EqualFold(filepath.Ext(path), ".xml") {
+			files = append(files, path)
+		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("scan workflow files: %w", err)
+	}
+
+	sort.Strings(files)
+	return files, nil
 }
 
 func NewCatalog(workflows ...*Workflow) (*Catalog, error) {

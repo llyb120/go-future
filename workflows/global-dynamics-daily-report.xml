@@ -1,0 +1,16 @@
+<workflow name="global-dynamics-daily-report" title="异动日报" description="聚合 mobile / steam / roblox 三个模块的异动日报；需要对应 intelligence/common/roblox 数据源。">
+  <input name="ReportDate" label="日报日期" required="true" placeholder="YYYY-MM-DD" description="报表日期，格式：YYYY-MM-DD" />
+
+  <var name="ReportDate" from="ReportDate" op="trim" />
+
+  <sql name="reportRows" mode="query" engine="gosql" datasource="default" src="global-dynamics.get-report-data" />
+
+  <transform name="reportData">
+    <field path="report_date" from="ReportDate" />
+    <field path="mobile" from="reportRows > :first > mobile_json" optional="true" default="[]" op="json" />
+    <field path="steam" from="reportRows > :first > steam_json" optional="true" default='{"top_list":[],"anomalies":[]}' op="json" />
+    <field path="roblox" from="reportRows > :first > roblox_json" optional="true" default='{"top_list":[],"anomalies":[]}' op="json" />
+  </transform>
+
+  <transform name="reportResponse" mode="js" from="reportData" entry="buildGlobalDynamicsDailyReport" />
+</workflow>

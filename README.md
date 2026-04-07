@@ -130,7 +130,7 @@ offset @offsetNum
 
 ## 外部源码引用
 
-为了避免把大段 SQL 和 JS 全塞在 XML 里，现在 `LoadDir(...)` 启动时会递归预扫描 workflow 目录下的全部 `.md` 和 `.js` 文件。
+为了避免把大段 SQL 和 JS 全塞在 XML 里，现在 `LoadDir(...)` 启动时会递归预扫描 workflow 目录下的 `.sql.md` 和 `.js` 文件。
 
 ### 1. 外部 SQL
 
@@ -140,7 +140,7 @@ offset @offsetNum
 
 规则：
 
-- 启动时会扫描 workflow 目录下全部 Markdown 文件
+- 启动时会扫描 workflow 目录下全部 `.sql.md`
 - `# 一级标题` 是命名空间
 - `## 二级标题` 是 SQL 名
 - workflow 里直接写 `namespace.sql-name`
@@ -181,6 +181,35 @@ export async function customerOrderStats({ input, keys, asArray }) {
 ```
 
 原来的内嵌 `<![CDATA[...]]>` 写法继续可用；但如果是放在目录里的辅助 JS，推荐直接走预加载模式，只保留函数名引用。
+
+### 推荐目录组织
+
+目录本身**没有固定格式要求**，`LoadDir(...)` 只是递归扫描 `.xml / .js / .sql.md`。为了避免资源混用，仍然按**每个 XML 所在目录**绑定资源树；如果某个子目录里也有 XML，会被当成另一个 workflow 目录边界。
+
+推荐这样组织：
+
+```text
+workflows
+├─ global-dynamics
+│  ├─ report.xml
+│  ├─ date.xml
+│  └─ res
+│     ├─ global-dynamics.sql.md
+│     └─ global-dynamics.js
+└─ reports
+   ├─ topcharts.xml
+   ├─ revenue.xml
+   └─ res
+      ├─ shared.sql.md
+      └─ shared.js
+```
+
+其中：
+
+- 文件名和目录名都不是约束，关键是扫描 `.xml / .js / .sql.md`
+- 一个目录里可以放多个 XML，共享这一层的 `res`
+- 当然也可以继续平铺，或者按业务拆更多层
+- 老的平铺结构仍然可用
 
 ## `pick` 选择器约定
 
@@ -438,13 +467,15 @@ go run .\cmd\go-future
 http://localhost:8080
 ```
 
-页面里现在有五个示例工作流：
+页面里现在有七个示例工作流：
 
 - `user-search`：简单变量整理 + 普通 SQL
 - `user-search-advanced`：复杂 JSON 输入 + `transform export="true"` 参数整理 + `gosql`
 - `category-tree`：先查平铺分类，再直接组 tree
 - `customer-orders-structured`：多表关联后返回带结构的客户订单视图
 - `customer-orders-external`：SQL 走 Markdown namespace 引用，JS 走预加载函数引用
+- `global-dynamics-daily-report`：按日期聚合 mobile / steam / roblox 异动日报
+- `global-dynamics-report-dates`：查询异动日报已有日期列表
 
 ## 测试
 
@@ -456,6 +487,9 @@ go test ./...
 
 ```text
 .
+├─ cmd
+│  └─ go-future
+│     └─ main.go
 ├─ internal
 │  ├─ data
 │  ├─ jsruntime
@@ -464,11 +498,17 @@ go test ./...
 ├─ workflows
 │  ├─ sql-users-search.xml
 │  ├─ sql-users-search-advanced.xml
-│  ├─ category-tree.xml
-│  └─ customer-orders-structured.xml
+│  ├─ customer-orders-external.xml
+│  ├─ customer-orders-structured.xml
+│  ├─ global-dynamics
+│  │  ├─ report.xml
+│  │  ├─ date.xml
+│  │  └─ res
+│  ├─ scripts
+│  └─ snippets
 ├─ data
 │  └─ demo.db
-├─ main.go
+├─ api.go
 └─ README.md
 ```
 
