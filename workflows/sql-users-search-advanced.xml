@@ -1,4 +1,4 @@
-<workflow name="user-search-advanced" title="复杂结构查询" description="演示 var、pick、transform 和 gosql 如何配合处理复杂 JSON 输入与动态 SQL。">
+<workflow name="user-search-advanced" title="复杂结构查询" description="演示如何先用一次 transform 整理参数，再直接交给 gosql。">
   <input name="payload" label="查询请求(JSON)" type="json" description="支持嵌套对象、数组和排序信息。"><![CDATA[
 {
   "tenant": "acme",
@@ -17,23 +17,14 @@
 }
   ]]></input>
 
-  <var name="tenantCode" from="payload > tenant" op="trim,upper" />
-  <var name="keyword" from="payload > filters > keyword" optional="true" default="" op="trim" />
-  <var name="keywordLike" template="%{{keyword}}%" />
-  <var name="statusList" from="payload > filters > statuses[*]" optional="true" default="[]" op="json" />
-  <var name="limitNum" from="payload > page > limit" optional="true" default="10" op="int" />
-  <var name="offsetNum" from="payload > page > offset" optional="true" default="0" op="int" />
-  <var name="sortColumn" from="payload > page > sort > column" optional="true" default="id" op="trim,lower,allow(id|name|email|status)" />
-  <var name="sortDirection" from="payload > page > sort > direction" optional="true" default="desc" op="trim,lower,allow(asc|desc)" />
-
-  <transform name="normalizedRequest">
-    <field path="tenant" from="tenantCode" />
-    <field path="filters.keyword" from="keyword" />
-    <field path="filters.statuses" from="statusList" />
-    <field path="page.limit" from="limitNum" />
-    <field path="page.offset" from="offsetNum" />
-    <field path="page.sort.column" from="sortColumn" />
-    <field path="page.sort.direction" from="sortDirection" />
+  <transform name="queryArgs" from="payload" export="true">
+    <field path="tenantCode" from="tenant" op="trim,upper" />
+    <field path="keyword" from="filters > keyword" optional="true" default="" op="trim" />
+    <field path="statusList" from="filters > statuses[*]" optional="true" default="[]" op="json" />
+    <field path="limitNum" from="page > limit" optional="true" default="10" op="int" />
+    <field path="offsetNum" from="page > offset" optional="true" default="0" op="int" />
+    <field path="sortColumn" from="page > sort > column" optional="true" default="id" op="trim,lower,allow(id|name|email|status)" />
+    <field path="sortDirection" from="page > sort > direction" optional="true" default="desc" op="trim,lower,allow(asc|desc)" />
   </transform>
 
   <sql mode="query" engine="gosql" datasource="default"><![CDATA[
@@ -41,7 +32,7 @@ select id, tenant, name, email, status
 from users
 where tenant = @tenantCode
 @if keyword != "" {
-  and (name like @keywordLike or email like @keywordLike)
+  and (name like '%' || @keyword || '%' or email like '%' || @keyword || '%')
 }
 @if len(statusList) > 0 {
   and status in (@statusList)

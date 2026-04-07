@@ -1,4 +1,4 @@
-# go-ai-future
+# go-future
 
 一个用 Go 编写的工作流型 Web 项目原型。
 
@@ -94,29 +94,23 @@ LIMIT :limitNum;
 }
   ]]></input>
 
-  <var name="tenantCode" from="payload > tenant" op="trim,upper" />
-  <var name="keyword" from="payload > filters > keyword" optional="true" default="" op="trim" />
-  <var name="keywordLike" template="%{{keyword}}%" />
-  <var name="statusList" from="payload > filters > statuses[*]" optional="true" default="[]" op="json" />
-  <var name="limitNum" from="payload > page > limit" optional="true" default="10" op="int" />
-  <var name="offsetNum" from="payload > page > offset" optional="true" default="0" op="int" />
-  <var name="sortColumn" from="payload > page > sort > column" optional="true" default="id" op="trim,lower,allow(id|name|email|status)" />
-  <var name="sortDirection" from="payload > page > sort > direction" optional="true" default="desc" op="trim,lower,allow(asc|desc)" />
-
-  <transform name="normalizedRequest">
-    <field path="tenant" from="tenantCode" />
-    <field path="filters.keyword" from="keyword" />
-    <field path="filters.statuses" from="statusList" />
-    <field path="page.limit" from="limitNum" />
-    <field path="page.offset" from="offsetNum" />
-    <field path="page.sort.column" from="sortColumn" />
-    <field path="page.sort.direction" from="sortDirection" />
+  <transform name="queryArgs" from="payload" export="true">
+    <field path="tenantCode" from="tenant" op="trim,upper" />
+    <field path="keyword" from="filters > keyword" optional="true" default="" op="trim" />
+    <field path="statusList" from="filters > statuses[*]" optional="true" default="[]" op="json" />
+    <field path="limitNum" from="page > limit" optional="true" default="10" op="int" />
+    <field path="offsetNum" from="page > offset" optional="true" default="0" op="int" />
+    <field path="sortColumn" from="page > sort > column" optional="true" default="id" op="trim,lower,allow(id|name|email|status)" />
+    <field path="sortDirection" from="page > sort > direction" optional="true" default="desc" op="trim,lower,allow(asc|desc)" />
   </transform>
 
   <sql mode="query" engine="gosql" datasource="default"><![CDATA[
 select id, tenant, name, email, status
 from users
 where tenant = @tenantCode
+@if keyword != "" {
+  and (name like '%' || @keyword || '%' or email like '%' || @keyword || '%')
+}
 @if len(statusList) > 0 {
   and status in (@statusList)
 }
@@ -136,34 +130,38 @@ offset @offsetNum
 
 ## 外部源码引用
 
-为了避免把大段 SQL 和 JS 全塞在 XML 里，现在 `sql` 与 `transform mode="js"` 都支持 `src`。
+为了避免把大段 SQL 和 JS 全塞在 XML 里，现在 `LoadDir(...)` 启动时会递归预扫描 workflow 目录下的全部 `.md` 和 `.js` 文件。
 
 ### 1. 外部 SQL
 
 ```xml
-<sql name="orders" mode="query" engine="gosql" src="snippets\customer-orders.md#orders-by-customer" />
+<sql name="orders" mode="query" engine="gosql" src="customer-orders.orders-by-customer" />
 ```
 
-支持：
+规则：
 
-- `.md`
-
-SQL 外链只支持 Markdown，因为 `gosql` 本身就是以 Markdown 代码块为入口。
-
-如果引用的是 Markdown：
-
-- 用 fenced code block 保存 SQL
-- `#片段名` 会匹配 Markdown 标题
-- `gosql` 官方约定里只解析 `sql` fenced code block
+- 启动时会扫描 workflow 目录下全部 Markdown 文件
+- `# 一级标题` 是命名空间
+- `## 二级标题` 是 SQL 名
+- workflow 里直接写 `namespace.sql-name`
+- 只读取 `sql` fenced code block
 - 是否按 `gosql` 语法执行，由 `<sql engine="gosql" ... />` 决定
+- 兼容场景下，原来的路径式 `src="xxx.md#heading"` 仍然可用
 
 ### 2. 外部 JS
 
 ```xml
-<transform name="customerOrderStats" mode="js" from="customerOrderView" src="scripts\customer-order-stats.js" entry="customerOrderStats" />
+<transform name="customerOrderStats" mode="js" from="customerOrderView" entry="customerOrderStats" />
 ```
 
-如果文件里只有一个处理逻辑，可以继续直接写处理代码；如果一个文件里要复用多个入口，可以导出多个函数，再用 `entry` 指定本次调用哪个：
+规则：
+
+- 启动时会扫描 workflow 目录下全部 `.js/.mjs/.cjs`
+- 导出的函数会被统一预加载
+- workflow 里只需要写 `entry` / `function` / `call`
+- 兼容场景下，原来的 `src="scripts\\xxx.js"` 写法继续可用
+
+预加载 JS 文件示例：
 
 ```js
 export function collectItems({ input, asArray }) {
@@ -182,7 +180,7 @@ export async function customerOrderStats({ input, keys, asArray }) {
 }
 ```
 
-`src` 路径默认相对于当前 workflow XML 文件；原来的内嵌 `<![CDATA[...]]>` 写法继续可用。若文件里只导出一个函数，`entry` 可以省略；导出多个时需要显式指定。
+原来的内嵌 `<![CDATA[...]]>` 写法继续可用；但如果是放在目录里的辅助 JS，推荐直接走预加载模式，只保留函数名引用。
 
 ## `pick` 选择器约定
 
@@ -210,14 +208,14 @@ export async function customerOrderStats({ input, keys, asArray }) {
 
 ### 1. 改结构：声明式 object
 
-如果只是把已有变量改成另一种结构，推荐直接写 `field`，比 JSON 模板更短：
+如果只是把已有变量改成另一种结构，推荐直接写 `field`；如果还想顺手把结果铺回变量上下文，可以再加 `export="true"`：
 
 ```xml
-<transform name="normalizedRequest">
-  <field path="tenant" from="tenantCode" />
-  <field path="filters.keyword" from="keyword" />
-  <field path="filters.statuses" from="statusList" />
-  <field path="page.limit" from="limitNum" />
+<transform name="queryArgs" from="payload" export="true">
+  <field path="tenantCode" from="tenant" op="trim,upper" />
+  <field path="keyword" from="filters > keyword" optional="true" default="" op="trim" />
+  <field path="statusList" from="filters > statuses[*]" optional="true" default="[]" op="json" />
+  <field path="limitNum" from="page > limit" optional="true" default="10" op="int" />
 </transform>
 ```
 
@@ -385,22 +383,22 @@ return {
 
 ## 作为库使用
 
-现在外部项目可以直接引用公开包：
+现在外部项目可以直接从根包引用公开 API：
 
 ```go
 import (
   "context"
   "database/sql"
 
-  wf "go-ai-future/workflow"
+  "github.com/llyb120/go-future"
 )
 
-catalog, err := wf.LoadDir("workflows")
+catalog, err := future.LoadDir("workflows")
 if err != nil {
   panic(err)
 }
 
-executor := wf.NewExecutor(map[string]*sql.DB{
+executor := future.NewExecutor(map[string]*sql.DB{
   "default": db,
 })
 
@@ -421,15 +419,17 @@ _ = result
 
 如果 workflow XML 不是放在目录里，也可以直接用：
 
-- `workflow.LoadFile(path)`
-- `workflow.Parse(content, sourcePath)`
-- `workflow.ParseString(content, sourcePath)`
-- `workflow.NewCatalog(...)`
+- `future.LoadFile(path)`
+- `future.Parse(content, sourcePath)`
+- `future.ParseString(content, sourcePath)`
+- `future.NewCatalog(...)`
+
+兼容旧调用方时，也仍然可以继续使用子包：`github.com/llyb120/go-future/workflow`
 
 ## 本地运行
 
-```bash
-go run .
+```powershell
+go run .\cmd\go-future
 ```
 
 启动后打开：
@@ -441,14 +441,14 @@ http://localhost:8080
 页面里现在有五个示例工作流：
 
 - `user-search`：简单变量整理 + 普通 SQL
-- `user-search-advanced`：复杂 JSON 输入 + 简化后的声明式结构重组 + `gosql`
+- `user-search-advanced`：复杂 JSON 输入 + `transform export="true"` 参数整理 + `gosql`
 - `category-tree`：先查平铺分类，再直接组 tree
 - `customer-orders-structured`：多表关联后返回带结构的客户订单视图
-- `customer-orders-external`：把 SQL 拆到 Markdown、把 JS 拆到独立脚本
+- `customer-orders-external`：SQL 走 Markdown namespace 引用，JS 走预加载函数引用
 
 ## 测试
 
-```bash
+```powershell
 go test ./...
 ```
 

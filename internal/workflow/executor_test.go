@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"go-ai-future/internal/data"
+	"github.com/llyb120/go-future/internal/data"
 
 	_ "modernc.org/sqlite"
 )
@@ -210,75 +210,18 @@ func TestExecutorRunGoSQLWorkflowWithComplexInput(t *testing.T) {
 		},
 		Steps: []Step{
 			{
-				Kind: "var",
-				Name: "tenantCode",
-				From: "payload > tenant",
-				Op:   "trim,upper",
-			},
-			{
-				Kind:     "var",
-				Name:     "keyword",
-				From:     "payload > filters > keyword",
-				Optional: true,
-				Default:  "",
-				Op:       "trim",
-			},
-			{
-				Kind:     "var",
-				Name:     "keywordLike",
-				Template: "%{{keyword}}%",
-			},
-			{
-				Kind:     "var",
-				Name:     "statusList",
-				From:     "payload > filters > statuses[*]",
-				Optional: true,
-				Default:  "[]",
-				Op:       "json",
-			},
-			{
-				Kind:     "var",
-				Name:     "limitNum",
-				From:     "payload > page > limit",
-				Optional: true,
-				Default:  "10",
-				Op:       "int",
-			},
-			{
-				Kind:     "var",
-				Name:     "offsetNum",
-				From:     "payload > page > offset",
-				Optional: true,
-				Default:  "0",
-				Op:       "int",
-			},
-			{
-				Kind:     "var",
-				Name:     "sortColumn",
-				From:     "payload > page > sort > column",
-				Optional: true,
-				Default:  "id",
-				Op:       "trim,lower,allow(id|name|email|status)",
-			},
-			{
-				Kind:     "var",
-				Name:     "sortDirection",
-				From:     "payload > page > sort > direction",
-				Optional: true,
-				Default:  "desc",
-				Op:       "trim,lower,allow(asc|desc)",
-			},
-			{
-				Kind: "transform",
-				Name: "normalizedRequest",
+				Kind:   "transform",
+				Name:   "queryArgs",
+				From:   "payload",
+				Export: true,
 				Children: []Step{
-					{Kind: "field", Path: "tenant", From: "tenantCode"},
-					{Kind: "field", Path: "filters.keyword", From: "keyword"},
-					{Kind: "field", Path: "filters.statuses", From: "statusList"},
-					{Kind: "field", Path: "page.limit", From: "limitNum"},
-					{Kind: "field", Path: "page.offset", From: "offsetNum"},
-					{Kind: "field", Path: "page.sort.column", From: "sortColumn"},
-					{Kind: "field", Path: "page.sort.direction", From: "sortDirection"},
+					{Kind: "field", Path: "tenantCode", From: "tenant", Op: "trim,upper"},
+					{Kind: "field", Path: "keyword", From: "filters > keyword", Optional: true, Default: "", Op: "trim"},
+					{Kind: "field", Path: "statusList", From: "filters > statuses[*]", Optional: true, Default: "[]", Op: "json"},
+					{Kind: "field", Path: "limitNum", From: "page > limit", Optional: true, Default: "10", Op: "int"},
+					{Kind: "field", Path: "offsetNum", From: "page > offset", Optional: true, Default: "0", Op: "int"},
+					{Kind: "field", Path: "sortColumn", From: "page > sort > column", Optional: true, Default: "id", Op: "trim,lower,allow(id|name|email|status)"},
+					{Kind: "field", Path: "sortDirection", From: "page > sort > direction", Optional: true, Default: "desc", Op: "trim,lower,allow(asc|desc)"},
 				},
 			},
 			{
@@ -290,7 +233,7 @@ select id, tenant, name, email, status
 from users
 where tenant = @tenantCode
 @if keyword != "" {
-  and (name like @keywordLike or email like @keywordLike)
+  and (name like '%' || @keyword || '%' or email like '%' || @keyword || '%')
 }
 @if len(statusList) > 0 {
   and status in (@statusList)
@@ -339,18 +282,18 @@ offset @offsetNum`,
 		t.Fatalf("expected rendered SQL to include status filter, got %q", result.SQL)
 	}
 
-	normalized, ok := findResolvedParam(result, "normalizedRequest")
+	queryArgs, ok := findResolvedParam(result, "queryArgs")
 	if !ok {
-		t.Fatalf("expected normalizedRequest to exist")
+		t.Fatalf("expected queryArgs to exist")
 	}
 
-	normalizedMap, ok := normalized.(map[string]any)
+	queryArgsMap, ok := queryArgs.(map[string]any)
 	if !ok {
-		t.Fatalf("expected normalizedRequest to be a map, got %T", normalized)
+		t.Fatalf("expected queryArgs to be a map, got %T", queryArgs)
 	}
 
-	if normalizedMap["tenant"] != "ACME" {
-		t.Fatalf("expected normalizedRequest.tenant to be ACME, got %#v", normalizedMap["tenant"])
+	if queryArgsMap["tenantCode"] != "ACME" {
+		t.Fatalf("expected queryArgs.tenantCode to be ACME, got %#v", queryArgsMap["tenantCode"])
 	}
 
 	statuses, ok := findResolvedParam(result, "statusList")
@@ -701,7 +644,7 @@ func TestExecutorRunSQLFromMarkdownSource(t *testing.T) {
   <var name="keyword" from="keyword" default="" op="trim" />
   <var name="keywordLike" template="%{{keyword}}%" />
 
-  <sql name="users" mode="query" engine="gosql" src="snippets\queries.md#active-users" />
+  <sql name="users" mode="query" engine="gosql" src="snippets.active-users" />
 </workflow>`
 
 	markdown := `# snippets
@@ -760,7 +703,7 @@ order by id
 	}
 }
 
-func TestExecutorRunJSFromExternalFile(t *testing.T) {
+func TestExecutorRunPreloadedJSFunction(t *testing.T) {
 	db := newTestDB(t)
 	dir := t.TempDir()
 
@@ -775,7 +718,7 @@ FROM customers
 WHERE lower(email) = :customerEmailKey;
   ]]></sql>
 
-  <transform name="customerSummary" mode="js" from="customerRows > :first" src="scripts\customer-summary.js" entry="customerSummary" />
+  <transform name="customerSummary" mode="js" from="customerRows > :first" entry="customerSummary" />
 </workflow>`
 
 	script := `export function selectedEmail({ input }) {
@@ -841,11 +784,11 @@ export async function customerSummary({ input, keys }) {
 	}
 }
 
-func TestLoadDirRejectsMultiExportJSWithoutEntry(t *testing.T) {
+func TestLoadDirRejectsUnknownPreloadedJSEntry(t *testing.T) {
 	dir := t.TempDir()
 
 	workflowXML := `<workflow name="bad-external-js" title="Bad JS Source">
-  <transform name="summary" mode="js" src="scripts\summary.js" />
+  <transform name="summary" mode="js" entry="missingSummary" />
 </workflow>`
 
 	script := `export function first() {
@@ -871,10 +814,10 @@ export function second() {
 
 	_, err := LoadDir(dir)
 	if err == nil {
-		t.Fatalf("expected LoadDir() to reject multi-export js without entry")
+		t.Fatalf("expected LoadDir() to reject unknown preloaded js entry")
 	}
-	if !strings.Contains(err.Error(), "exports multiple functions") {
-		t.Fatalf("expected multi-export entry error, got %v", err)
+	if !strings.Contains(err.Error(), "not found in preloaded javascript resources") {
+		t.Fatalf("expected unknown preloaded javascript error, got %v", err)
 	}
 }
 

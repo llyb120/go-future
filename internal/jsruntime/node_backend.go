@@ -71,7 +71,7 @@ func (b *lockedBuffer) String() string {
 }
 
 func newNodeRuntime() (Runtime, error) {
-	file, err := os.CreateTemp("", "go-ai-future-js-*.js")
+	file, err := os.CreateTemp("", "go-future-js-*.js")
 	if err != nil {
 		return nil, fmt.Errorf("create node runner: %w", err)
 	}

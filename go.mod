@@ -1,4 +1,4 @@
-module go-ai-future
+module github.com/llyb120/go-future
 
 go 1.25.0
 

@@ -1,6 +1,6 @@
 # 工作流编制说明
 
-这份文档是 `go-ai-future` 当前工作流系统的完整编制说明。
+这份文档是 `github.com/llyb120/go-future` 当前工作流系统的完整编制说明。
 
 目标有两个：
 
@@ -409,10 +409,10 @@ productById > {{product_id}}
 ### 8.1 `object`：声明式改结构
 
 ```xml
-<transform name="normalizedRequest">
-  <field path="tenant" from="tenantCode" />
-  <field path="filters.keyword" from="keyword" />
-  <field path="filters.statuses" from="statusList" />
+<transform name="queryArgs" from="payload" export="true">
+  <field path="tenantCode" from="tenant" op="trim,upper" />
+  <field path="keyword" from="filters > keyword" optional="true" default="" op="trim" />
+  <field path="statusList" from="filters > statuses[*]" optional="true" default="[]" op="json" />
 </transform>
 ```
 
@@ -420,6 +420,8 @@ productById > {{product_id}}
 
 - 创建一个新的对象
 - 每个 `field` 决定往哪个路径写什么值
+- 如果加上 `export="true"`，对象第一层字段也会同步写入变量上下文
+- 很适合先声明式整理一批 SQL 入参，再直接给后续 `sql` 使用
 
 ### 8.2 `field` 的属性
 
@@ -443,6 +445,13 @@ productById > {{product_id}}
 
 - `op`
   - 字段级后处理
+
+补充：
+
+- `transform export="true"`
+  - 只对顶层 `transform` 生效
+  - 要求结果是对象
+  - 会把对象第一层字段同步写入变量上下文，同时保留原始 `transform name`
 
 ### 8.3 `tree`：平铺节点组树
 
@@ -526,25 +535,19 @@ return {
 
 ### 8.8 JS 外部源码引用
 
-如果不想把 JS 直接写进 XML，可以使用 `src`：
+如果不想把 JS 直接写进 XML，推荐直接使用预加载函数名：
 
 ```xml
-<transform name="customerOrderStats" mode="js" from="customerOrderView" src="scripts\customer-order-stats.js" entry="customerOrderStats" />
+<transform name="customerOrderStats" mode="js" from="customerOrderView" entry="customerOrderStats" />
 ```
 
 规则：
 
-- `src` 路径默认相对于当前 workflow XML 文件
-- 支持直接引用：
-  - `.js`
-  - `.mjs`
-  - `.cjs`
-  - `.md`
-- 如果使用 Markdown：
-  - 系统会查找 `js` 或 `javascript` fenced code block
-  - `src="xxx.md#heading-name"` 时，会优先在对应标题下找代码块
-- `src` 与内嵌 `<![CDATA[...]]>` 二选一，不能同时写
-- 如果一个文件导出多个函数，需要通过 `entry` 指定入口函数
+- `LoadDir(...)` 会递归预扫描 workflow 目录下全部 `.js/.mjs/.cjs`
+- 导出的函数会被统一预加载
+- workflow 里只需要写 `entry` / `function` / `call`
+- 内嵌 `<![CDATA[...]]>` 继续可用
+- 兼容场景下，路径式 `src="scripts\\xxx.js"` 也仍然可用
 
 外部 JS 支持两种写法：
 
@@ -667,26 +670,22 @@ export async function customerOrderStats({ input, keys, asArray }) {
 
 ### 10.2 外部 SQL 引用
 
-如果 SQL 很长，或者你想把 SQL 和 workflow 拆开维护，可以给 `sql` 配 `src`：
+如果 SQL 很长，或者你想把 SQL 和 workflow 拆开维护，推荐直接给 `sql` 配命名空间引用：
 
 ```xml
-<sql name="orders" mode="query" engine="gosql" src="snippets\customer-orders.md#orders-by-customer" />
+<sql name="orders" mode="query" engine="gosql" src="customer-orders.orders-by-customer" />
 ```
-
-当前支持：
-
-- `.md`
-- `.markdown`
 
 规则：
 
-- `src` 路径默认相对于当前 workflow XML 文件
+- `LoadDir(...)` 会递归预扫描 workflow 目录下全部 Markdown 文件
+- `# 一级标题` 是命名空间
+- `## 二级标题` 是 SQL 名
+- workflow 里直接写 `namespace.sql-name`
 - `src` 与内嵌 SQL 二选一，不能同时写
-- 外部 SQL 只从 Markdown 读取，这样与 `gosql` 的官方组织方式一致
-- 如果引用 Markdown：
-  - 只读取 `sql` fenced code block
-  - 是否按 `gosql` 语法执行，由当前 `<sql>` 的 `engine` 属性决定
-  - `src="xxx.md#heading-name"` 时，会优先在对应标题下找代码块
+- 只读取 `sql` fenced code block
+- 是否按 `gosql` 语法执行，由当前 `<sql>` 的 `engine` 属性决定
+- 兼容场景下，旧的路径式 `src="xxx.md#heading-name"` 仍然可用
 
 Markdown 片段示例：
 
@@ -842,20 +841,21 @@ customerEmail
 
 本地运行：
 
-```bash
-go run .
+```powershell
+go run .\cmd\go-future
 ```
 
 测试：
 
-```bash
+```powershell
 go test ./...
 ```
 
 如果默认端口被占用：
 
-```bash
-ADDR=:18080 go run .
+```powershell
+$env:ADDR = ":18080"
+go run .\cmd\go-future
 ```
 
 ---
@@ -875,7 +875,7 @@ ADDR=:18080 go run .
   - 多 SQL 依赖链 + workflow 组数 + JS summary
 
 - `customer-orders-external.xml`
-  - 与上面同一个主题，但把 SQL 放到 Markdown，把 JS 放到独立脚本
+  - 与上面同一个主题，但 SQL 走 Markdown namespace 引用，JS 走预加载函数引用
 
 ---
 

@@ -1,4 +1,4 @@
-# Customer order snippets
+# customer-orders
 
 ## customer-rows
 

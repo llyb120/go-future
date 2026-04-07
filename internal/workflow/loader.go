@@ -24,11 +24,21 @@ func LoadDir(dir string) (*Catalog, error) {
 		return nil, fmt.Errorf("no workflow xml files found in %s", dir)
 	}
 
+	resources, err := loadResourceRegistry(dir)
+	if err != nil {
+		return nil, err
+	}
+
 	workflows := make([]*Workflow, 0, len(matches))
 	for _, file := range matches {
-		wf, err := LoadFile(file)
+		content, err := os.ReadFile(file)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read workflow file %s: %w", file, err)
+		}
+
+		wf, err := parseWithResources(content, file, resources)
+		if err != nil {
+			return nil, fmt.Errorf("load workflow file %s: %w", file, err)
 		}
 		workflows = append(workflows, wf)
 	}
@@ -42,7 +52,7 @@ func LoadFile(path string) (*Workflow, error) {
 		return nil, fmt.Errorf("read workflow file %s: %w", path, err)
 	}
 
-	wf, err := Parse(content, path)
+	wf, err := parseWithResources(content, path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("load workflow file %s: %w", path, err)
 	}
@@ -51,6 +61,10 @@ func LoadFile(path string) (*Workflow, error) {
 }
 
 func Parse(content []byte, sourcePath string) (*Workflow, error) {
+	return parseWithResources(content, sourcePath, nil)
+}
+
+func parseWithResources(content []byte, sourcePath string, resources *resourceRegistry) (*Workflow, error) {
 	var wf Workflow
 	if err := xml.Unmarshal(content, &wf); err != nil {
 		return nil, fmt.Errorf("parse workflow xml: %w", err)
@@ -58,6 +72,7 @@ func Parse(content []byte, sourcePath string) (*Workflow, error) {
 
 	wf.SourcePath = sourcePath
 	wf.RawXML = string(content)
+	wf.resources = resources
 
 	if err := wf.Validate(); err != nil {
 		return nil, err

@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"go-ai-future/internal/data"
-	"go-ai-future/internal/workflow"
+	"github.com/llyb120/go-future/internal/data"
+	"github.com/llyb120/go-future/internal/workflow"
 
 	_ "modernc.org/sqlite"
 )

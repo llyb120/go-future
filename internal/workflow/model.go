@@ -16,6 +16,7 @@ type Workflow struct {
 
 	SourcePath string `xml:"-"`
 	RawXML     string `xml:"-"`
+	resources  *resourceRegistry
 }
 
 type Input struct {
@@ -42,6 +43,7 @@ type Step struct {
 	Template    string
 	Default     string
 	Op          string
+	Export      bool
 	Optional    bool
 	Mode        string
 	Datasource  string
@@ -125,6 +127,8 @@ func (s *Step) UnmarshalXML(decoder *xml.Decoder, start xml.StartElement) error 
 			s.Default = attr.Value
 		case "op":
 			s.Op = attr.Value
+		case "export":
+			s.Export = strings.EqualFold(attr.Value, "true")
 		case "optional":
 			s.Optional = strings.EqualFold(attr.Value, "true")
 		case "mode":
@@ -245,6 +249,9 @@ func validateStep(step Step, topLevel bool, workflowName string) error {
 		if topLevel && strings.TrimSpace(step.Name) == "" {
 			return fmt.Errorf("top-level <transform> in workflow %q must define name", workflowName)
 		}
+		if !topLevel && step.Export {
+			return fmt.Errorf("<transform> in workflow %q only supports export at top level", workflowName)
+		}
 		if step.TransformMode() == "js" {
 			if len(step.Children) > 0 {
 				return fmt.Errorf("<transform mode=js> in workflow %q does not support child steps", workflowName)
@@ -252,8 +259,8 @@ func validateStep(step Step, topLevel bool, workflowName string) error {
 			if step.HasInlineBody() && step.HasSourceRef() {
 				return fmt.Errorf("<transform name=%q mode=js> in workflow %q cannot define both src and inline body", step.Name, workflowName)
 			}
-			if !step.HasInlineBody() && !step.HasSourceRef() {
-				return fmt.Errorf("<transform name=%q mode=js> in workflow %q must define script body or src", step.Name, workflowName)
+			if !step.HasInlineBody() && !step.HasSourceRef() && strings.TrimSpace(step.Entry) == "" {
+				return fmt.Errorf("<transform name=%q mode=js> in workflow %q must define script body, src or entry", step.Name, workflowName)
 			}
 			if step.HasInlineBody() {
 				if _, _, err := prepareJSTransformScript(step.Body(), step.Entry); err != nil {
@@ -409,10 +416,16 @@ func (w *Workflow) validateExternalSources(step Step) error {
 		if _, _, err := resolveStepBody(w, step, "sql"); err != nil {
 			return err
 		}
-	case step.Kind == "transform" && step.TransformMode() == "js" && step.HasSourceRef():
+	case step.Kind == "transform" && step.TransformMode() == "js":
 		body, _, err := resolveStepBody(w, step, "js")
 		if err != nil {
 			return err
+		}
+		if body == "" {
+			return fmt.Errorf("%s does not resolve to a javascript source", stepLabel(step))
+		}
+		if !step.HasInlineBody() && !step.HasSourceRef() {
+			break
 		}
 		if _, _, err := prepareJSTransformScript(body, step.Entry); err != nil {
 			return err

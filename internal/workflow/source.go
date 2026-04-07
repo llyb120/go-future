@@ -16,11 +16,30 @@ type markdownFence struct {
 
 func resolveStepBody(wf *Workflow, step Step, expectedKind string) (string, string, error) {
 	if !step.HasSourceRef() {
+		if expectedKind == "js" && !step.HasInlineBody() && strings.TrimSpace(step.Entry) != "" {
+			if wf == nil || wf.resources == nil {
+				return "", "", fmt.Errorf("%s entry %q requires preloaded javascript resources from LoadDir", stepLabel(step), step.Entry)
+			}
+			if bundle, ok := wf.resources.resolvePreloadedJS(step.Entry); ok {
+				return bundle, "js-preloaded", nil
+			}
+			return "", "", fmt.Errorf("%s entry %q not found in preloaded javascript resources", stepLabel(step), step.Entry)
+		}
 		return step.Body(), inferInlineLanguage(step, expectedKind), nil
 	}
 
 	if step.HasInlineBody() {
 		return "", "", fmt.Errorf("%s cannot define both src and inline body", stepLabel(step))
+	}
+
+	if expectedKind == "sql" && isNamedResourceReference(step.Source) {
+		if wf == nil || wf.resources == nil {
+			return "", "", fmt.Errorf("%s named sql source %q requires preloaded markdown resources from LoadDir", stepLabel(step), step.Source)
+		}
+		if body, language, ok := wf.resources.resolveSQLSource(step.Source); ok {
+			return body, language, nil
+		}
+		return "", "", fmt.Errorf("%s sql source %q not found in preloaded markdown resources", stepLabel(step), step.Source)
 	}
 
 	resolvedPath, fragment := resolveStepSourcePath(wf, step.Source)
@@ -48,6 +67,26 @@ func resolveStepBody(wf *Workflow, step Step, expectedKind string) (string, stri
 		}
 		return "", "", fmt.Errorf("%s src %q has unsupported extension %q", stepLabel(step), step.Source, ext)
 	}
+}
+
+func isNamedResourceReference(source string) bool {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return false
+	}
+
+	pathPart, _, _ := strings.Cut(source, "#")
+	if strings.ContainsAny(pathPart, `\/`) {
+		return false
+	}
+
+	ext := strings.ToLower(filepath.Ext(pathPart))
+	switch ext {
+	case ".md", ".markdown", ".js", ".mjs", ".cjs", ".sql":
+		return false
+	}
+
+	return strings.Contains(pathPart, ".")
 }
 
 func resolveStepSourcePath(wf *Workflow, source string) (string, string) {

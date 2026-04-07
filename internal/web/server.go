@@ -7,7 +7,7 @@ import (
 	"html/template"
 	"net/http"
 
-	"go-ai-future/internal/workflow"
+	"github.com/llyb120/go-future/internal/workflow"
 )
 
 //go:embed templates/*.html

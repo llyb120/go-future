@@ -11,15 +11,16 @@ import (
 	"strconv"
 	"strings"
 
-	"go-ai-future/internal/jsruntime"
+	"github.com/llyb120/go-future/internal/jsruntime"
 
 	"github.com/llyb120/gosql"
 )
 
 var (
-	templateVarPattern = regexp.MustCompile(`\{\{\s*([^{}]+?)\s*\}\}`)
-	sqlParamPattern    = regexp.MustCompile(`:([A-Za-z_][A-Za-z0-9_]*)`)
-	jsExportPattern    = regexp.MustCompile(`(?m)^\s*export\s+(async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(`)
+	templateVarPattern  = regexp.MustCompile(`\{\{\s*([^{}]+?)\s*\}\}`)
+	sqlParamPattern     = regexp.MustCompile(`:([A-Za-z_][A-Za-z0-9_]*)`)
+	jsExportPattern     = regexp.MustCompile(`(?m)^\s*export\s+(async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(`)
+	jsHostExportPattern = regexp.MustCompile(`host\.export\(\s*["']([^"']+)["']\s*,`)
 )
 
 type Executor struct {
@@ -150,6 +151,11 @@ func (e *Executor) executeStep(ctx context.Context, wf *Workflow, step Step, var
 			return err
 		}
 		vars[step.Name] = value
+		if step.Export {
+			if err := exportObjectVars(step, value, vars); err != nil {
+				return err
+			}
+		}
 	case "set":
 		value, err := e.evaluateLegacySet(step, vars)
 		if err != nil {
@@ -160,6 +166,19 @@ func (e *Executor) executeStep(ctx context.Context, wf *Workflow, step Step, var
 		return e.executeSQL(ctx, wf, step, vars, execution)
 	default:
 		return fmt.Errorf("unsupported step <%s>", step.Kind)
+	}
+
+	return nil
+}
+
+func exportObjectVars(step Step, value any, vars map[string]any) error {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return fmt.Errorf("<transform name=%q export=true> expects an object result, got %T", step.Name, value)
+	}
+
+	for key, nested := range object {
+		vars[key] = nested
 	}
 
 	return nil
@@ -581,14 +600,20 @@ func (e *Executor) evaluateJSTransform(wf *Workflow, step Step, vars map[string]
 		filename = "workflow_transform.js"
 	}
 
-	scriptBody, _, err := resolveStepBody(wf, step, "js")
+	scriptBody, sourceLanguage, err := resolveStepBody(wf, step, "js")
 	if err != nil {
 		return nil, err
 	}
 
-	scriptSource, entryName, err := prepareJSTransformScript(scriptBody, step.Entry)
-	if err != nil {
-		return nil, err
+	scriptSource := scriptBody
+	entryName := strings.TrimSpace(step.Entry)
+	if sourceLanguage != "js-preloaded" {
+		scriptSource, entryName, err = prepareJSTransformScript(scriptBody, step.Entry)
+		if err != nil {
+			return nil, err
+		}
+	} else if entryName == "" {
+		return nil, fmt.Errorf("%s must define entry when using preloaded javascript functions", stepLabel(step))
 	}
 	if err := rt.LoadScript(filename, scriptSource); err != nil {
 		return nil, fmt.Errorf("load javascript transform: %w", err)
@@ -645,26 +670,14 @@ func prepareJSTransformScript(source string, entry string) (string, string, erro
 }
 
 func buildExportedJSTransformScript(source string, entry string) (string, string, error) {
-	matches := jsExportPattern.FindAllStringSubmatch(source, -1)
-	if len(matches) == 0 {
+	exportedNames := collectExportedJSFunctionNames(source)
+	if len(exportedNames) == 0 {
 		return "", "", fmt.Errorf("javascript source contains export syntax but no supported exported function declaration")
 	}
 
-	exportedNames := make([]string, 0, len(matches))
-	seen := make(map[string]struct{}, len(matches))
-	for _, match := range matches {
-		if len(match) < 3 {
-			continue
-		}
-		name := strings.TrimSpace(match[2])
-		if name == "" {
-			continue
-		}
-		if _, exists := seen[name]; exists {
-			continue
-		}
+	seen := make(map[string]struct{}, len(exportedNames))
+	for _, name := range exportedNames {
 		seen[name] = struct{}{}
-		exportedNames = append(exportedNames, name)
 	}
 
 	if entry == "" {
@@ -703,6 +716,48 @@ const workflowAsArray = (value) => Array.isArray(value) ? value : (value == null
 	}
 
 	return exportBuilder.String(), entry, nil
+}
+
+func collectExportedJSFunctionNames(source string) []string {
+	matches := jsExportPattern.FindAllStringSubmatch(source, -1)
+	names := make([]string, 0, len(matches))
+	seen := make(map[string]struct{}, len(matches))
+	for _, match := range matches {
+		if len(match) < 3 {
+			continue
+		}
+		name := strings.TrimSpace(match[2])
+		if name == "" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return names
+}
+
+func collectHostExportNames(source string) []string {
+	matches := jsHostExportPattern.FindAllStringSubmatch(source, -1)
+	names := make([]string, 0, len(matches))
+	seen := make(map[string]struct{}, len(matches))
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		name := strings.TrimSpace(match[1])
+		if name == "" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return names
 }
 
 func (e *Executor) resolveValue(step Step, vars map[string]any, current any, allowCurrent bool) (any, error) {

@@ -10,9 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"go-ai-future/internal/data"
-	"go-ai-future/internal/web"
-	"go-ai-future/workflow"
+	future "github.com/llyb120/go-future"
 
 	_ "modernc.org/sqlite"
 )
@@ -42,20 +40,20 @@ func main() {
 		log.Fatalf("ping sqlite: %v", err)
 	}
 
-	if err := data.EnsureDemoData(ctx, db); err != nil {
+	if err := future.EnsureDemoData(ctx, db); err != nil {
 		log.Fatalf("bootstrap demo data: %v", err)
 	}
 
-	catalog, err := workflow.LoadDir(workflowDir)
+	catalog, err := future.LoadDir(workflowDir)
 	if err != nil {
 		log.Fatalf("load workflows: %v", err)
 	}
 
-	executor := workflow.NewExecutor(map[string]*sql.DB{
+	executor := future.NewExecutor(map[string]*sql.DB{
 		"default": db,
 	})
 
-	server, err := web.NewServer(catalog, executor)
+	server, err := future.NewServer(catalog, executor)
 	if err != nil {
 		log.Fatalf("build web server: %v", err)
 	}

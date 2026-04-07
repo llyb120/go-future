@@ -1,23 +1,23 @@
-<workflow name="customer-orders-external" title="客户订单结构视图（外部源码）" description="SQL 从 Markdown 代码块引用，JS 从独立脚本引用，演示如何让工作流 XML 保持简洁。">
+<workflow name="customer-orders-external" title="客户订单结构视图（外部源码）" description="SQL 从 Markdown namespace 引用，JS 从预加载函数引用，演示如何让工作流 XML 保持简洁。">
   <input name="customerEmail" label="客户邮箱" default="alice.future@demo.ai" />
   <input name="orderStatus" label="订单状态" default="" placeholder="如 paid，可留空" />
 
   <var name="customerEmailKey" from="customerEmail" default="alice.future@demo.ai" op="trim,lower" />
   <var name="orderStatus" from="orderStatus" default="" op="trim,lower" />
 
-  <sql name="customerRows" mode="query" src="snippets\customer-orders.md#customer-rows" />
+  <sql name="customerRows" mode="query" src="customer-orders.customer-rows" />
 
   <var name="customerId" from="customerRows > :first > id" op="int" />
 
-  <sql name="orders" mode="query" engine="gosql" src="snippets\customer-orders.md#orders-by-customer" />
+  <sql name="orders" mode="query" engine="gosql" src="customer-orders.orders-by-customer" />
 
   <var name="orderIds" from="orders > id" optional="true" default="[]" op="json" />
 
-  <sql name="orderItems" mode="query" engine="gosql" src="snippets\customer-orders.md#order-items-by-order-ids" />
+  <sql name="orderItems" mode="query" engine="gosql" src="customer-orders.order-items-by-order-ids" />
 
   <var name="productIds" from="orderItems > product_id" optional="true" default="[]" op="json" />
 
-  <sql name="products" mode="query" engine="gosql" src="snippets\customer-orders.md#products-by-product-ids" />
+  <sql name="products" mode="query" engine="gosql" src="customer-orders.products-by-product-ids" />
 
   <transform name="productById" from="products" mode="index" by="id" />
 
@@ -46,5 +46,5 @@
     <field path="orders" from="ordersView" />
   </transform>
 
-  <transform name="customerOrderStats" mode="js" from="customerOrderView" src="scripts\customer-order-stats.js" entry="customerOrderStats" />
+  <transform name="customerOrderStats" mode="js" from="customerOrderView" entry="customerOrderStats" />
 </workflow>
